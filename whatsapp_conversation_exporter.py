@@ -80,21 +80,191 @@ class WhatsAppExporter:
         except Exception:
             return None
     
-    def _decode_reaction(self, blob):
+    def _decode_reaction(self, blob, is_group=False, group_jid=None):
         """Decode emoji reaction from blob."""
         if not blob:
             return None
         try:
-            hex_data = blob.hex().lower()
-            if 'f09f' in hex_data:
-                matches = re.findall(r'f09f[0-9a-f]{4}', hex_data)
+            hex_data = blob.hex().upper()
+            
+            # Find emoji
+            emoji = None
+            if 'F09F' in hex_data:
+                matches = re.findall(r'F09F[0-9A-F]{4}', hex_data)
                 if matches:
-                    return bytes.fromhex(matches[0]).decode('utf-8')
-            if 'e29da4' in hex_data:
-                return '❤️'
+                    emoji = bytes.fromhex(matches[0]).decode('utf-8')
+            elif 'E29DA4' in hex_data:
+                emoji = '❤️'
+            
+            if not emoji:
+                return None
+            
+            # For groups, try to extract who reacted
+            if is_group:
+                return self._decode_group_reactions(hex_data, emoji, group_jid)
+            else:
+                return emoji
+                
         except Exception:
             pass
         return None
+    
+    def _decode_group_reactions(self, hex_data, emoji, group_jid=None):
+        """Decode group reactions with person names."""
+        try:
+            # Find JID patterns in hex data
+            jid_matches = re.findall(r'333[0-9A-F]+?40732E77686174736170702E6E6574', hex_data)
+            
+            if not jid_matches:
+                return emoji
+            
+            reactors = []
+            for jid_hex in jid_matches:
+                try:
+                    # Decode JID
+                    jid_bytes = bytes.fromhex(jid_hex)
+                    jid_raw = jid_bytes.decode('utf-8', errors='ignore')
+                    
+                    # Extract clean phone number
+                    phone_match = re.search(r'(\d+)@s\.whatsapp\.net', jid_raw)
+                    if phone_match:
+                        phone = phone_match.group(1)
+                        clean_jid = f'{phone}@s.whatsapp.net'
+                        
+                        # Get name and create unique initials for this group
+                        name = self._get_contact_name(clean_jid)
+                        if name and name != clean_jid and 'Contact (' not in name:
+                            if group_jid:
+                                initials = self._get_group_initials_for_jid(group_jid, clean_jid)
+                            else:
+                                initials = self._get_initials(name)
+                            reactors.append(initials)
+                except:
+                    continue
+            
+            if reactors:
+                # Remove duplicates while preserving order
+                unique_reactors = []
+                for reactor in reactors:
+                    if reactor not in unique_reactors:
+                        unique_reactors.append(reactor)
+                
+                if len(unique_reactors) == 1:
+                    return f"[{unique_reactors[0]}:{emoji}]"
+                else:
+                    reactor_list = ';'.join([f"{r}:{emoji}" for r in unique_reactors])
+                    return f"[{reactor_list}]"
+            
+            return emoji
+            
+        except Exception:
+            return emoji
+    
+    def _get_initials(self, name):
+        """Generate initials from a name."""
+        if not name:
+            return "?"
+        
+        # Split name and take first letter of each word
+        words = name.split()
+        initials = ''.join([word[0].upper() for word in words if word])
+        
+        # Limit to 3 characters max
+        return initials[:3] if initials else "?"
+    
+    def _get_group_unique_initials(self, group_jid):
+        """Generate unique initials for all members of a group."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Get all group members with their names
+                cursor.execute("""
+                    SELECT gm.ZMEMBERJID, cs.ZPARTNERNAME
+                    FROM ZWAGROUPMEMBER gm
+                    LEFT JOIN ZWACHATSESSION cs ON gm.ZMEMBERJID = cs.ZCONTACTJID
+                    LEFT JOIN ZWACHATSESSION gs ON gs.ZCONTACTJID = ?
+                    WHERE gm.ZCHATSESSION = gs.Z_PK
+                    AND cs.ZPARTNERNAME IS NOT NULL
+                    AND cs.ZPARTNERNAME != ''
+                """, (group_jid,))
+                
+                members = cursor.fetchall()
+                
+                # Create mapping of JID to name
+                jid_to_name = {}
+                for jid, name in members:
+                    if jid and name:
+                        jid_to_name[jid] = name
+                
+                # Generate initial initials
+                name_to_initials = {}
+                initials_count = {}
+                
+                for jid, name in jid_to_name.items():
+                    basic_initials = self._get_initials(name)
+                    name_to_initials[name] = basic_initials
+                    initials_count[basic_initials] = initials_count.get(basic_initials, 0) + 1
+                
+                # Resolve conflicts by using more letters from first names
+                final_initials = {}
+                for name, initials in name_to_initials.items():
+                    if initials_count[initials] > 1:
+                        # There's a conflict, need to make unique
+                        words = name.split()
+                        if len(words) >= 2:
+                            # Use beginning of first name + initials of last names
+                            first_name = words[0]
+                            last_names = words[1:]  # All words after first name
+                            
+                            # Take first letter (uppercase) + rest lowercase from first name
+                            # Then uppercase first letter of each last name
+                            first_part = first_name[0].upper() + first_name[1:2].lower()
+                            last_part = ''.join([word[0].upper() for word in last_names])
+                            
+                            unique_initials = first_part + last_part
+                            
+                            # If still conflict, add more characters from first name
+                            counter = 3
+                            base_unique = unique_initials
+                            while unique_initials in final_initials.values():
+                                if len(first_name) > counter - 1:
+                                    first_part = first_name[0].upper() + first_name[1:counter].lower()
+                                    unique_initials = first_part + last_part
+                                    counter += 1
+                                else:
+                                    # Fallback: add numbers
+                                    unique_initials = base_unique + str(counter-2)
+                                    counter += 1
+                            
+                            final_initials[name] = unique_initials
+                        else:
+                            final_initials[name] = initials
+                    else:
+                        final_initials[name] = initials
+                
+                # Create reverse mapping: JID to unique initials
+                jid_to_initials = {}
+                for jid, name in jid_to_name.items():
+                    jid_to_initials[jid] = final_initials.get(name, "?")
+                
+                return jid_to_initials
+                
+        except Exception as e:
+            print(f"Error generating group initials: {e}")
+            return {}
+    
+    def _get_group_initials_for_jid(self, group_jid, member_jid):
+        """Get unique initials for a specific member in a group."""
+        # Cache group initials to avoid recalculating
+        cache_key = f"group_initials_{group_jid}"
+        if not hasattr(self, '_group_initials_cache'):
+            self._group_initials_cache = {}
+        
+        if cache_key not in self._group_initials_cache:
+            self._group_initials_cache[cache_key] = self._get_group_unique_initials(group_jid)
+        
+        return self._group_initials_cache[cache_key].get(member_jid, "?")
     
     def _extract_quoted_text(self, cursor, media_item_id):
         """Extract quoted text from media metadata."""
@@ -360,7 +530,7 @@ class WhatsAppExporter:
                     # Decode reaction
                     reaction_emoji = None
                     if row[7]:
-                        reaction_emoji = self._decode_reaction(row[7])
+                        reaction_emoji = self._decode_reaction(row[7], is_group, contact_jid if is_group else None)
                     
                     # Extract quoted text
                     quoted_text = None
@@ -487,7 +657,7 @@ class WhatsAppExporter:
                 
                 message_line = f"    {sender_prefix}{msg['content']}"
                 if msg['reaction_emoji']:
-                    message_line += f" [{msg['reaction_emoji']}]"
+                    message_line += f" {msg['reaction_emoji']}"
                 output.append(message_line)
             else:
                 # Regular message
@@ -496,7 +666,7 @@ class WhatsAppExporter:
                     content = f"(forward) {content}"
                 message_line = f"[{time_part}] {prefix} {sender_prefix}{content}"
                 if msg['reaction_emoji']:
-                    message_line += f" [{msg['reaction_emoji']}]"
+                    message_line += f" {msg['reaction_emoji']}"
                 output.append(message_line)
         
         # Stats
