@@ -87,14 +87,40 @@ class WhatsAppExporter:
         try:
             hex_data = blob.hex().upper()
             
-            # Find emoji
+            # Find emoji with automatic modifier detection
             emoji = None
             if 'F09F' in hex_data:
-                matches = re.findall(r'F09F[0-9A-F]{4}', hex_data)
-                if matches:
-                    emoji = bytes.fromhex(matches[0]).decode('utf-8')
-            elif 'E29DA4' in hex_data:
-                emoji = '❤️'
+                # Modern emojis (F09F prefix) - may have skin tone modifiers
+                base_matches = re.findall(r'F09F[0-9A-F]{4}', hex_data)
+                if base_matches:
+                    # Check for skin tone modifier after base emoji
+                    base_emoji = base_matches[0]
+                    base_pos = hex_data.find(base_emoji)
+                    remaining = hex_data[base_pos + len(base_emoji):]
+                    
+                    # Look for skin tone modifier (F09F8F[BB-BF])
+                    skin_modifier = re.match(r'F09F8F(BB|BC|BD|BE|BF)', remaining)
+                    if skin_modifier:
+                        full_sequence = base_emoji + skin_modifier.group(0)
+                        emoji = bytes.fromhex(full_sequence).decode('utf-8')
+                    else:
+                        emoji = bytes.fromhex(base_emoji).decode('utf-8')
+                        
+            elif hex_data.startswith('E2') or 'E2' in hex_data:
+                # Legacy Unicode symbols (E2xx prefix) - may have color modifiers
+                base_matches = re.findall(r'E2[0-9A-F]{4}', hex_data)
+                if base_matches:
+                    base_emoji = base_matches[0]
+                    base_pos = hex_data.find(base_emoji)
+                    remaining = hex_data[base_pos + len(base_emoji):]
+                    
+                    # Look for color modifier (EFB8[8F-AB])
+                    color_modifier = re.match(r'EFB8[8-9A-B][0-9A-F]', remaining)
+                    if color_modifier:
+                        full_sequence = base_emoji + color_modifier.group(0)
+                        emoji = bytes.fromhex(full_sequence).decode('utf-8')
+                    else:
+                        emoji = bytes.fromhex(base_emoji).decode('utf-8')
             
             if not emoji:
                 return None
