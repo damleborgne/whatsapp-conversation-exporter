@@ -22,6 +22,12 @@ import sys
 from datetime import datetime
 
 
+# ForwardInfo helper class for forwarded message hash placeholders
+class ForwardInfo:
+    def __init__(self, hash_id: str):
+        self.hash_id = hash_id
+
+
 class WhatsAppReactionExtractor:
     """Local version of the reaction extractor for the specific database."""
     
@@ -228,6 +234,7 @@ class WhatsAppConversationExporter:
                     ZWAMESSAGE.ZFROMJID AS from_jid,
                     ZWAMESSAGE.ZTOJID AS to_jid,
                     ZWAMESSAGE.ZISFROMME AS is_from_me,
+                    ZWAMESSAGE.ZFLAGS AS flags,
                     ZWAMESSAGE.ZMESSAGETYPE AS message_type,
                     ZWAMESSAGEINFO.ZRECEIPTINFO AS reaction_blob,
                     ZWAMESSAGE.ZPARENTMESSAGE AS parent_message_id,
@@ -256,8 +263,8 @@ class WhatsAppConversationExporter:
                 for row in rows:
                     # Decode reaction if present
                     reaction_emoji = None
-                    if row[7]:  # reaction_blob exists
-                        reaction_data = self.extractor._decode_reaction_blob(row[7])
+                    if row[8]:  # reaction_blob exists (index shifted by insertion of flags)
+                        reaction_data = self.extractor._decode_reaction_blob(row[8])
                         if (reaction_data and 
                             reaction_data.get('type') == 'potential_reaction' and
                             'detected_emoji' in reaction_data):
@@ -266,8 +273,15 @@ class WhatsAppConversationExporter:
                     # Extract quoted text from MediaItem metadata if present
                     # Use intelligent validation to distinguish real citations from binary artifacts
                     quoted_text = None
-                    if row[9]:  # media_item_id exists
-                        quoted_text = self._extract_quoted_text_from_media(cursor, row[9])
+                    if row[10]:  # media_item_id exists
+                        quoted_text = self._extract_quoted_text_from_media(cursor, row[10])
+
+                    # If metadata produced a ForwardInfo but there is an explicit parent message id, treat it as a normal reply (use parent snippet later)
+                    if isinstance(quoted_text, ForwardInfo) and row[9]:
+                        quoted_text = None
+
+                    flags = row[6] or 0
+                    is_forwarded_flag = bool(flags & 0x180 == 0x180)
                     
                     message = {
                         'message_id': row[0],
@@ -277,12 +291,31 @@ class WhatsAppConversationExporter:
                         'to_jid': row[4],
                         'is_from_me': bool(row[5]),
                         'reaction_emoji': reaction_emoji,
-                        'parent_message_id': row[8],
-                        'quoted_text': quoted_text
+                        'parent_message_id': row[9],
+                        'quoted_text': quoted_text,
+                        'is_forwarded': is_forwarded_flag
                     }
                     messages.append(message)
                     message_lookup[message['message_id']] = message
                 
+                # Build mapping media_item_id -> message for metadata-based reply inference
+                media_to_message = {}
+                for m in messages:
+                    mid = None
+                    # We didn't store media_item_id earlier; re-query minimal mapping for this batch (optimization skipped for clarity)
+                    # Add lightweight cache: message_lookup already; fetch media ids in one query
+                # Pre-fetch media ids for all message ids to avoid altering initial select
+                try:
+                    ids_tuple = tuple(msg['message_id'] for msg in messages)
+                    if ids_tuple:
+                        ph = ','.join(['?']*len(ids_tuple))
+                        cursor.execute(f"SELECT Z_PK,ZMEDIAITEM FROM ZWAMESSAGE WHERE Z_PK IN ({ph})", ids_tuple)
+                        mw = {r[0]: r[1] for r in cursor.fetchall()}
+                        for m in messages:
+                            m['_media_item_id'] = mw.get(m['message_id'])
+                except Exception:
+                    pass
+
                 # Second pass: resolve quoted messages via ZPARENTMESSAGE (fallback)
                 for message in messages:
                     if not message['quoted_text'] and message['parent_message_id'] and message['parent_message_id'] in message_lookup:
@@ -292,6 +325,234 @@ class WhatsAppConversationExporter:
                         if len(parent_msg['content']) > 50:
                             quoted_content += "..."
                         message['quoted_text'] = quoted_content
+
+                # Systematic metadata-based reconstruction: extract quoted text from protobuf metadata fields
+                try:
+                    import datetime as _dt
+                    # Index original messages by content prefix for fast lookup
+                    originals_index = {}
+                    for m in messages:
+                        txt = (m.get('content') or '').strip()
+                        if len(txt) >= 40:
+                            key = txt[:60]
+                            originals_index.setdefault(key, []).append(m)
+
+                    # Collect media items for messages without quotes but with metadata
+                    targets = [m for m in messages if not m.get('quoted_text') and not m.get('parent_message_id') and m.get('_media_item_id')]
+                    if targets:
+                        mids = tuple(m['_media_item_id'] for m in targets)
+                        ph = ','.join(['?']*len(mids))
+                        cursor.execute(f"SELECT Z_PK,ZMETADATA FROM ZWAMEDIAITEM WHERE Z_PK IN ({ph})", mids)
+                        meta_map = {r[0]: r[1] for r in cursor.fetchall() if r[1]}
+                        
+                        for m in targets:
+                            blob = meta_map.get(m['_media_item_id'])
+                            if not blob:
+                                continue
+                            
+                            # Parse protobuf length-delimited fields; collect text for specific tags
+                            parts = []
+                            i = 0
+                            while i < len(blob)-2:
+                                b = blob[i]
+                                wt = b & 7
+                                tagno = b >> 3
+                                if wt == 2 and i+1 < len(blob):
+                                    l = blob[i+1]
+                                    seg = blob[i+2:i+2+l]
+                                    i += 2 + l
+                                    # Tags 5,6,9,13,14 contain fragments of original quoted text
+                                    if 10 < l < 130 and tagno in (5,6,9,13,14):
+                                        try:
+                                            t = seg.decode('utf-8','ignore').strip()
+                                            if t:
+                                                parts.append(t)
+                                        except:
+                                            pass
+                                else:
+                                    i += 1
+                            
+                            if len(parts) < 2:
+                                continue
+                                
+                            # Reconstruct quoted text from fragments
+                            recon = ' '.join(parts)
+                            
+                            # Find message whose content contains fragments from reconstruction
+                            selected = None
+                            best_delta = None
+                            for key, cand_list in originals_index.items():
+                                # Check if any substantial fragment from reconstruction appears in candidate
+                                found_match = False
+                                for part in parts:
+                                    if len(part) > 15 and part in key:  # Fragment appears in candidate
+                                        found_match = True
+                                        break
+                                # Alternative: check if candidate text appears in reconstruction
+                                if not found_match and key[:25] in recon:
+                                    found_match = True
+                                
+                                if found_match:
+                                    for cand in cand_list:
+                                        # Must be different sender and earlier timestamp
+                                        if cand.get('is_from_me') == m.get('is_from_me'):
+                                            continue
+                                        if not cand.get('date') or not m.get('date'):
+                                            continue
+                                        try:
+                                            t_c = _dt.datetime.strptime(cand['date'],'%Y-%m-%d %H:%M:%S')
+                                            t_m = _dt.datetime.strptime(m['date'],'%Y-%m-%d %H:%M:%S')
+                                            if t_c >= t_m:
+                                                continue
+                                            delta = (t_m - t_c).total_seconds()
+                                            if delta > 48*3600:  # Within 48h
+                                                continue
+                                            if best_delta is None or delta < best_delta:
+                                                selected = cand
+                                                best_delta = delta
+                                        except:
+                                            continue
+                            
+                            # Assign reconstructed quote if match found
+                            if selected and not m.get('quoted_text'):
+                                snippet = selected['content'][:90]
+                                if len(selected['content']) > 90:
+                                    words = snippet.split()
+                                    if len(words) > 1:
+                                        snippet = ' '.join(words[:-1]) + '...'
+                                    else:
+                                        snippet = snippet[:85] + '...'
+                                m['quoted_text'] = snippet
+                                m['quoted_source_message_id'] = selected['message_id']
+                except Exception:
+                    pass
+
+                # Third pass: resolve forwarded hash placeholders to actual text when possible
+                import re, datetime as _dt
+                forward_hash_re = re.compile(r"^[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}$")
+                def _looks_like_forward_hash(s: str) -> bool:
+                    if not forward_hash_re.match(s):
+                        return False
+                    # Complexity requirement: must contain at least one of digit / brace / uppercase (beyond first char)
+                    has_complex = any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in s)
+                    if not has_complex:
+                        return False  # reject simple words like "aujourd'hui"
+                    return True
+                # Build list with index for quick access
+                for idx, msg in enumerate(messages):
+                    qt = msg.get('quoted_text')
+                    if isinstance(qt, ForwardInfo):
+                        # Already a ForwardInfo object; try to resolve
+                        hash_id = qt.hash_id
+                    elif isinstance(qt, str) and qt:
+                        candidate = qt.strip()
+                        if _looks_like_forward_hash(candidate):
+                            hash_id = candidate
+                            msg['quoted_text'] = ForwardInfo(hash_id)
+                        else:
+                            continue
+                    else:
+                        continue
+                    # Look backwards for candidate original message (same sender, close in time, longer content)
+                    best_candidate = None
+                    for prev in reversed(messages[max(0, idx-8):idx]):  # look back up to 8 messages
+                        if prev.get('is_from_me') != msg.get('is_from_me'):
+                            continue
+                        content = prev.get('content') or ''
+                        if len(content) < 25:
+                            continue
+                        # Time proximity
+                        try:
+                            if prev['date'] and msg['date']:
+                                # dates are strings; parse minimal
+                                # Expect format 'YYYY-MM-DD HH:MM:SS'
+                                def _parse(ts):
+                                    try:
+                                        return _dt.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+                                    except Exception:
+                                        return None
+                                t_prev = _parse(prev['date'])
+                                t_msg = _parse(msg['date'])
+                                if t_prev and t_msg and (t_msg - t_prev).total_seconds() > 180:
+                                    continue
+                        except Exception:
+                            pass
+                        best_candidate = prev
+                        break
+                    if best_candidate:
+                        msg['forward_resolved_text'] = best_candidate['content']
+                        best_candidate['used_as_forward_source'] = True
+
+                # Fourth pass: remove spurious citations that just duplicate the immediately previous message
+                for idx, msg in enumerate(messages):
+                    qt = msg.get('quoted_text')
+                    if not qt:
+                        continue
+                    # Handle ForwardInfo duplication
+                    if isinstance(qt, ForwardInfo):
+                        if idx > 0:
+                            prev = messages[idx-1]
+                            resolved = msg.get('forward_resolved_text')
+                            prev_content = (prev.get('content') or '').strip()
+                            if resolved and prev_content and resolved.strip() == prev_content and not msg.get('parent_message_id'):
+                                same_sender = prev.get('is_from_me') == msg.get('is_from_me') and prev.get('from_jid') == msg.get('from_jid')
+                                # Time proximity
+                                def _p(ts):
+                                    try:
+                                        return _dt.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S') if ts else None
+                                    except Exception:
+                                        return None
+                                t_prev = _p(prev.get('date'))
+                                t_msg = _p(msg.get('date'))
+                                close_time = False
+                                if t_prev and t_msg:
+                                    try:
+                                        close_time = (t_msg - t_prev).total_seconds() < 6
+                                    except Exception:
+                                        pass
+                                if same_sender or close_time:
+                                    # Drop spurious forward duplicate
+                                    msg['quoted_text'] = None
+                                    msg.pop('forward_resolved_text', None)
+                                    msg.pop('forward_source_used', None)
+                        continue
+                    if idx == 0:
+                        continue
+                    prev = messages[idx-1]
+                    # Conditions for spurious duplicate:
+                    # - quoted text exactly equals previous content (after trimming)
+                    # - no parent message id (so not an explicit reply)
+                    # - previous sender same as current sender OR time delta < 5s (often fragmentation)
+                    prev_content = (prev.get('content') or '').strip()
+                    if not prev_content:
+                        continue
+                    if qt.strip() == prev_content and not msg.get('parent_message_id'):
+                        same_sender = prev.get('is_from_me') == msg.get('is_from_me') and prev.get('from_jid') == msg.get('from_jid')
+                        # Parse times
+                        def _p(ts):
+                            try:
+                                return _dt.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S') if ts else None
+                            except Exception:
+                                return None
+                        t_prev = _p(prev.get('date'))
+                        t_msg = _p(msg.get('date'))
+                        close_time = False
+                        if t_prev and t_msg:
+                            try:
+                                close_time = (t_msg - t_prev).total_seconds() < 6
+                            except Exception:
+                                pass
+                        if same_sender or close_time:
+                            # If current content begins with the quoted text (pure duplication at line wrap), drop citation
+                            content_now = (msg.get('content') or '')
+                            if content_now.startswith(prev_content):
+                                msg['quoted_text'] = None
+                            else:
+                                # Different content: still may not be a true quote; drop if very short quote (< 60) and no parent
+                                if len(prev_content) < 120:
+                                    msg['quoted_text'] = None
+                            msg.pop('forward_resolved_text', None)
+                            msg.pop('forward_source_used', None)
                 
                 return messages
                 
@@ -313,8 +574,8 @@ class WhatsAppConversationExporter:
                 result = cursor.fetchone()
                 
                 if result and result[0]:
-                    metadata_blob, media_origin = result[0], result[1]                # SYSTEMATIC PROTOBUF PARSING: Extract Tag 1 (citation text)
-                try:
+                    metadata_blob, media_origin = result[0], result[1]
+                    # existing parsing loop...
                     i = 0
                     
                     while i < len(metadata_blob) - 2:
@@ -340,17 +601,24 @@ class WhatsAppConversationExporter:
                                         quoted_text = re.sub(r'^[\x00-\x1f]+', '', quoted_text)
 
                                         if quoted_text:
-                                            # SYSTEMATIC ACCEPTANCE: SEULEMENT Tag 1 pour les citations  
-                                            if tag == 1 and len(quoted_text) > 10:
-                                                # Truncate if too long (systematic)
-                                                if len(quoted_text) > 50:
-                                                    words = quoted_text[:50].split()
-                                                    if len(words) > 1:
-                                                        quoted_text = ' '.join(words[:-1]) + "..."
-                                                    else:
-                                                        quoted_text = quoted_text[:50] + "..."
-                                                
-                                                return quoted_text
+                                            # SYSTEMATIC ACCEPTANCE: SEULEMENT Tag 1 pour les citations / forwards
+                                            if tag == 1 and len(quoted_text) > 3:
+                                                import re
+                                                # Remove control chars for forward hash pattern test
+                                                sanitized = re.sub(r"[^A-Za-z0-9'`{}]", "", quoted_text)
+                                                # Forward hash complexity: require at least one digit/brace/uppercase besides letters
+                                                if re.fullmatch(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", sanitized):
+                                                    if any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in sanitized):
+                                                        return ForwardInfo(sanitized)
+                                                # Normal human citation (keep spaces)
+                                                if len(quoted_text) > 10 and (' ' in quoted_text):
+                                                    if len(quoted_text) > 50:
+                                                        words = quoted_text[:50].split()
+                                                        if len(words) > 1:
+                                                            quoted_text = ' '.join(words[:-1]) + "..."
+                                                        else:
+                                                            quoted_text = quoted_text[:50] + "..."
+                                                    return quoted_text
                                         
                                     except UnicodeDecodeError:
                                         pass
@@ -361,10 +629,18 @@ class WhatsAppConversationExporter:
                         else:
                             i += 1
                     
-                    return None
-                    
-                except Exception:
-                    # If protobuf parsing fails completely, return None
+                    # When no quoted_text but metadata_blob exists, attempt forward hash detection
+                    try:
+                        import re
+                        # Scan raw bytes for ascii window that matches pattern
+                        raw_ascii = ''.join(chr(b) if 32 <= b < 127 else ' ' for b in metadata_blob)
+                        # Forward hash pattern: two alnum segments around an apostrophe/backtick, optional tail (alnum or { })
+                        candidates = re.findall(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", raw_ascii)
+                        for cand in candidates:
+                            if any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in cand):
+                                return ForwardInfo(cand)
+                    except Exception:
+                        pass
                     return None
             
         except Exception as e:
@@ -391,6 +667,7 @@ class WhatsAppConversationExporter:
         # Messages
         current_date = None
         for msg in messages:
+            # If this message was only used as a forward source, still print it normally (we keep context)
             message_date = msg['date']
             if not message_date:
                 continue
@@ -422,7 +699,30 @@ class WhatsAppConversationExporter:
             if msg.get('quoted_text'):
                 # Multi-line format for quoted messages
                 output.append(f"[{time_part}] {prefix}")
-                output.append(f"    ↳ \"{msg['quoted_text']}\"")
+                
+                # Citation / forward
+                citation = msg.get('quoted_text')
+                if citation:
+                    if isinstance(citation, ForwardInfo):
+                        # Prefer resolved text if available
+                        resolved = msg.get('forward_resolved_text')
+                        if resolved:
+                            lines_fw = resolved.split('\n')
+                            output.append(f"    ↳ (forwarded) {lines_fw[0]}")
+                            for extra in lines_fw[1:]:
+                                output.append(f"       {extra}")
+                        else:
+                            output.append(f"    ↳ (forwarded id {citation.hash_id})")
+                    else:
+                        # Multi-line support
+                        lines = citation.split('\n')
+                        if len(lines) == 1:
+                            output.append(f"    ↳ {lines[0]}")
+                        else:
+                            output.append(f"    ↳ {lines[0]}")
+                            for extra in lines[1:]:
+                                output.append(f"       {extra}")
+                
                 message_line = f"    {msg['content']}"
                 # Add reaction if present
                 if msg['reaction_emoji']:
@@ -430,7 +730,10 @@ class WhatsAppConversationExporter:
                 output.append(message_line)
             else:
                 # Single line format for regular messages
-                message_line = f"[{time_part}] {prefix} {msg['content']}"
+                content = msg['content']
+                if msg.get('is_forwarded'):
+                    content = f"(forward) {content}"
+                message_line = f"[{time_part}] {prefix} {content}"
                 # Add reaction if present
                 if msg['reaction_emoji']:
                     message_line += f" [{msg['reaction_emoji']}]"
