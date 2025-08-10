@@ -292,9 +292,95 @@ class WhatsAppExporter:
         
         return self._group_initials_cache[cache_key].get(member_jid, "?")
     
+    def _get_media_type_name(self, message_type):
+        """Get human-readable media type name."""
+        media_types = {
+            1: "Image",
+            2: "Audio", 
+            3: "Video",
+            5: "Location",
+            9: "Document",
+            13: "GIF",
+            14: "Sticker"
+        }
+        return media_types.get(message_type, "Media")
+    
+    def _prepare_media_path(self, contact_name, media_info):
+        """Prepare media path and copy file if needed."""
+        if not media_info or not media_info.get('local_path'):
+            return None
+            
+        original_path = media_info['local_path']
+        
+        # Create media directory structure
+        safe_contact_name = "".join(c for c in contact_name if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')
+        media_dir = f"conversations/media/{safe_contact_name}"
+        
+        if not os.path.exists(media_dir):
+            os.makedirs(media_dir, exist_ok=True)
+        
+        # Extract filename from original path
+        filename = os.path.basename(original_path)
+        if not filename:
+            # Generate filename from UUID in path
+            import re
+            uuid_match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.\w+)', original_path)
+            if uuid_match:
+                filename = uuid_match.group(1)
+            else:
+                filename = f"media_{media_info.get('message_type', 'unknown')}.unknown"
+        
+        relative_path = f"media/{safe_contact_name}/{filename}"
+        full_target_path = f"conversations/{relative_path}"
+        
+        # Try to copy the file if it exists
+        whatsapp_media_dir = os.path.expanduser("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/")
+        full_source_path = os.path.join(whatsapp_media_dir, "Message", original_path)
+        
+        try:
+            if os.path.exists(full_source_path) and not os.path.exists(full_target_path):
+                import shutil
+                shutil.copy2(full_source_path, full_target_path)
+                print(f"   📎 Copied media: {filename}")
+            elif os.path.exists(full_target_path):
+                print(f"   📎 Media exists: {filename}")
+            else:
+                print(f"   📎 Media not found: {filename}")
+        except Exception as e:
+            print(f"   ⚠️ Could not copy media {filename}: {e}")
+        
+        return relative_path
+    
     def _extract_quoted_text(self, cursor, media_item_id):
         """Extract quoted text from media metadata."""
         try:
+            # First, try to get the media info itself (for media quotes)
+            cursor.execute("SELECT ZMEDIALOCALPATH, ZTITLE, ZMESSAGE FROM ZWAMEDIAITEM WHERE Z_PK = ?", (media_item_id,))
+            media_result = cursor.fetchone()
+            
+            if media_result and media_result[0]:  # Has media path
+                media_path = media_result[0]
+                media_title = media_result[1]
+                
+                # Get media type from path extension
+                if media_path:
+                    ext = os.path.splitext(media_path)[1].lower()
+                    if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+                        media_type = "Image"
+                    elif ext in ['.mp4', '.mov', '.avi']:
+                        media_type = "Video"
+                    elif ext in ['.mp3', '.wav', '.m4a']:
+                        media_type = "Audio"
+                    else:
+                        media_type = "Media"
+                    
+                    # If there's a title/comment with the media, include it
+                    if media_title and media_title.strip():
+                        return f"[{media_type}] {media_title.strip()}"
+                    else:
+                        return f"[{media_type}]"
+            
+            # If no direct media info, try to extract from metadata blob
             cursor.execute("SELECT ZMETADATA FROM ZWAMEDIAITEM WHERE Z_PK = ?", (media_item_id,))
             result = cursor.fetchone()
             if not result or not result[0]:
@@ -316,14 +402,15 @@ class WhatsAppExporter:
                             text = re.sub(r'[\x00-\x1f]+', '', text)
                             
                             if len(text) > 3:
-                                # Check for forward hash
+                                # Check for forward hash (only if it really looks like one)
                                 sanitized = re.sub(r"[^A-Za-z0-9'`{}]", "", text)
-                                if (re.fullmatch(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", sanitized) and
+                                if (len(sanitized) > 10 and 
+                                    re.fullmatch(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", sanitized) and
                                     any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in sanitized)):
                                     return ForwardInfo(sanitized)
                                 
-                                # Regular quote
-                                if ' ' in text and len(text) > 10:
+                                # Regular quote - be more permissive
+                                if len(text) > 3:  # Lower threshold
                                     if len(text) > 50:
                                         words = text[:50].split()
                                         text = ' '.join(words[:-1]) + "..." if len(words) > 1 else text[:50] + "..."
@@ -335,17 +422,9 @@ class WhatsAppExporter:
                 else:
                     i += 1
             
-            # Fallback: scan for forward hash
-            try:
-                raw_ascii = ''.join(chr(b) if 32 <= b < 127 else ' ' for b in blob)
-                candidates = re.findall(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", raw_ascii)
-                for cand in candidates:
-                    if any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in cand):
-                        return ForwardInfo(cand)
-            except Exception:
-                pass
-            
+            # Last resort: if we reach here, there's no actual quoted content
             return None
+            
         except Exception:
             return None
     
@@ -502,8 +581,8 @@ class WhatsAppExporter:
             print(f"❌ Error getting all contacts: {e}")
             return []
     
-    def get_conversation(self, contact_jid, limit=None):
-        """Get conversation with all features."""
+    def get_conversation(self, contact_jid, limit=None, recent=False):
+        """Get conversation with all features including media."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -512,39 +591,49 @@ class WhatsAppExporter:
                 is_group = contact_jid.endswith('@g.us')
                 
                 if is_group:
-                    # Group conversation query with sender names
+                    # Group conversation query with sender names and media
                     query = """
                         SELECT 
                             m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
                             m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM,
-                            cs.ZPARTNERNAME, gm.ZMEMBERJID
+                            cs.ZPARTNERNAME, gm.ZMEMBERJID, m.ZMESSAGETYPE,
+                            mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZFILESIZE
                         FROM ZWAMESSAGE m
                         LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
                         LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
                         LEFT JOIN ZWACHATSESSION cs ON gm.ZMEMBERJID = cs.ZCONTACTJID
+                        LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
                         WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
-                        AND m.ZMESSAGETYPE = 0 AND m.ZTEXT IS NOT NULL AND m.ZTEXT != ''
-                        ORDER BY m.ZMESSAGEDATE ASC
-                    """
+                        AND m.ZMESSAGETYPE IN (0, 1, 2, 3, 5, 9, 13, 14)
+                        AND (m.ZTEXT IS NOT NULL OR m.ZMEDIAITEM IS NOT NULL)
+                        ORDER BY m.ZMESSAGEDATE {}
+                    """.format("DESC" if recent else "ASC")
                 else:
-                    # Individual conversation query
+                    # Individual conversation query with media
                     query = """
                         SELECT 
                             m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
                             m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM,
-                            NULL, NULL
+                            NULL, NULL, m.ZMESSAGETYPE,
+                            mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZFILESIZE
                         FROM ZWAMESSAGE m
                         LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
+                        LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
                         WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
-                        AND m.ZMESSAGETYPE = 0 AND m.ZTEXT IS NOT NULL AND m.ZTEXT != ''
-                        ORDER BY m.ZMESSAGEDATE ASC
-                    """
+                        AND m.ZMESSAGETYPE IN (0, 1, 2, 3, 5, 9, 13, 14)
+                        AND (m.ZTEXT IS NOT NULL OR m.ZMEDIAITEM IS NOT NULL)
+                        ORDER BY m.ZMESSAGEDATE {}
+                    """.format("DESC" if recent else "ASC")
                 
                 if limit:
                     query += f" LIMIT {limit}"
                 
                 cursor.execute(query, (contact_jid, contact_jid))
                 rows = cursor.fetchall()
+                
+                # If recent=True, reverse the order to maintain chronological display
+                if recent:
+                    rows = list(reversed(rows))
                 
                 print(f"📋 Found {len(rows)} messages...")
                 
@@ -558,12 +647,13 @@ class WhatsAppExporter:
                     if row[7]:
                         reaction_emoji = self._decode_reaction(row[7], is_group, contact_jid if is_group else None)
                     
-                    # Extract quoted text
+                    # Extract quoted text - only for messages that are actually quotes/replies
                     quoted_text = None
-                    if row[9]:  # media_item_id
-                        quoted_text = self._extract_quoted_text(cursor, row[9])
-                        if isinstance(quoted_text, ForwardInfo) and row[8]:  # parent_message_id exists
-                            quoted_text = None
+                    if row[8]:  # parent_message_id exists - this is definitely a reply
+                        if row[9]:  # has media_item_id, try to extract from metadata
+                            quoted_text = self._extract_quoted_text(cursor, row[9])
+                            if isinstance(quoted_text, ForwardInfo):
+                                quoted_text = None  # Don't show forward hashes as quotes
                     
                     flags = row[6] or 0
                     is_forwarded = bool(flags & 0x180 == 0x180)
@@ -572,6 +662,16 @@ class WhatsAppExporter:
                     sender_name = None
                     if is_group and not bool(row[5]):  # Not from me
                         sender_name = row[10]  # ZPARTNERNAME from the join
+                    
+                    # Handle media
+                    media_info = None
+                    if row[9]:  # has media_item_id
+                        media_info = {
+                            'local_path': row[13],
+                            'title': row[14],
+                            'file_size': row[15],
+                            'message_type': row[12]
+                        }
                     
                     message = {
                         'message_id': row[0],
@@ -585,7 +685,9 @@ class WhatsAppExporter:
                         'quoted_text': quoted_text,
                         'is_forwarded': is_forwarded,
                         'sender_name': sender_name,
-                        '_media_item_id': row[9]
+                        '_media_item_id': row[9],
+                        'message_type': row[12],
+                        'media_info': media_info
                     }
                     self.messages.append(message)
                     message_lookup[message['message_id']] = message
@@ -681,19 +783,84 @@ class WhatsAppExporter:
                         for extra in lines[1:]:
                             output.append(f"       {extra}")
                 
-                message_line = f"    {sender_prefix}{msg['content']}"
+                # Handle media in quoted messages
+                if msg.get('media_info'):
+                    media_type = self._get_media_type_name(msg['media_info'].get('message_type', 0))
+                    size_kb = msg['media_info'].get('file_size', 0) // 1024 if msg['media_info'].get('file_size') else 0
+                    
+                    # Check if media file exists locally
+                    media_path = self._prepare_media_path(contact_name, msg['media_info'])
+                    
+                    # Use markdown link format for better VS Code support
+                    if media_path:
+                        filename = os.path.basename(media_path)
+                        media_line = f"    📎 {media_type}: [{filename}](./{media_path})"
+                    else:
+                        media_line = f"    📎 {media_type}: [Not downloaded]"
+                    
+                    if size_kb > 0:
+                        media_line += f" ({size_kb} KB)"
+                    if msg['media_info'].get('title'):
+                        media_line += f" - {msg['media_info']['title']}"
+                    output.append(media_line)
+                
+                message_line = f"    {sender_prefix}{msg['content'] or ''}"
                 if msg['reaction_emoji']:
                     message_line += f" {msg['reaction_emoji']}"
-                output.append(message_line)
+                if message_line.strip() != f"    {sender_prefix}":  # Only add if there's actual content
+                    output.append(message_line)
             else:
-                # Regular message
-                content = msg['content']
-                if msg.get('is_forwarded'):
-                    content = f"(forward) {content}"
-                message_line = f"[{time_part}] {prefix} {sender_prefix}{content}"
-                if msg['reaction_emoji']:
-                    message_line += f" {msg['reaction_emoji']}"
-                output.append(message_line)
+                # Regular message - handle media first, then text
+                if msg.get('media_info'):
+                    # Always show media with its filename
+                    media_type = self._get_media_type_name(msg['media_info'].get('message_type', 0))
+                    size_kb = msg['media_info'].get('file_size', 0) // 1024 if msg['media_info'].get('file_size') else 0
+                    
+                    # Check if media file exists locally
+                    media_path = self._prepare_media_path(contact_name, msg['media_info'])
+                    
+                    # Use markdown link format for better VS Code support
+                    if media_path:
+                        # Media downloaded and available
+                        filename = os.path.basename(media_path)
+                        message_line = f"[{time_part}] {prefix} {sender_prefix}📎 {media_type}: [{filename}](./{media_path})"
+                    else:
+                        # Media not downloaded locally
+                        message_line = f"[{time_part}] {prefix} {sender_prefix}📎 {media_type}: [Not downloaded]"
+                    
+                    if size_kb > 0:
+                        message_line += f" ({size_kb} KB)"
+                    if msg['media_info'].get('title'):
+                        message_line += f" - {msg['media_info']['title']}"
+                    if msg['reaction_emoji']:
+                        message_line += f" {msg['reaction_emoji']}"
+                    
+                    output.append(message_line)
+                    
+                    # Add content as separate comment line if it exists
+                    content = msg['content'] or ''
+                    if msg.get('is_forwarded'):
+                        content = f"(forward) {content}"
+                    
+                    if content.strip():
+                        comment_line = f"    💬 {content}"
+                        output.append(comment_line)
+                        
+                elif msg['content'] and msg['content'].strip():
+                    # Text-only message (no media)
+                    content = msg['content']
+                    if msg.get('is_forwarded'):
+                        content = f"(forward) {content}"
+                    message_line = f"[{time_part}] {prefix} {sender_prefix}{content}"
+                    if msg['reaction_emoji']:
+                        message_line += f" {msg['reaction_emoji']}"
+                    output.append(message_line)
+                else:
+                    # This should never happen - warn about completely empty messages
+                    if not msg.get('media_info') and not (msg['content'] and msg['content'].strip()):
+                        print(f"⚠️ Warning: Empty message found (ID: {msg.get('message_id')}, Type: {msg.get('message_type')})")
+                        # Still show it with a placeholder to avoid losing data
+                        output.append(f"[{time_part}] {prefix} {sender_prefix}[Empty message - Type {msg.get('message_type', '?')}]")
         
         # Stats
         output.append("")
@@ -718,7 +885,7 @@ class WhatsAppExporter:
         output.append("=" * 80)
         return "\n".join(output)
     
-    def export_conversation(self, contact_name_or_jid, output_file=None, limit=None):
+    def export_conversation(self, contact_name_or_jid, output_file=None, limit=None, recent=False):
         """Export conversation to file."""
         print(f"🔍 Looking for contact: {contact_name_or_jid}")
         
@@ -750,7 +917,7 @@ class WhatsAppExporter:
         print(f"✅ Found contact: {target_contact['name']} ({target_contact['jid']})")
         
         # Get messages
-        messages = self.get_conversation(target_contact['jid'], limit)
+        messages = self.get_conversation(target_contact['jid'], limit, recent)
         if not messages:
             print(f"❌ No messages found for {target_contact['name']}")
             return None
@@ -760,7 +927,8 @@ class WhatsAppExporter:
             safe_name = "".join(c for c in target_contact['name'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
             safe_name = safe_name.replace(' ', '_')
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_file = os.path.join(conversations_dir, f"whatsapp_conversation_{safe_name}_{timestamp}.txt")
+            suffix = "_recent" if recent else ""
+            output_file = os.path.join(conversations_dir, f"whatsapp_conversation_{safe_name}{suffix}_{timestamp}.md")
         else:
             output_file = os.path.join(conversations_dir, os.path.basename(output_file))
         
@@ -790,6 +958,7 @@ def main():
     # Parse arguments
     contact_name = None
     limit = None
+    recent = False
     
     i = 1
     while i < len(sys.argv):
@@ -799,9 +968,12 @@ def main():
         elif sys.argv[i] == "--limit" and i + 1 < len(sys.argv):
             limit = int(sys.argv[i + 1])
             i += 2
+        elif sys.argv[i] == "--recent":
+            recent = True
+            i += 1
         else:
             print(f"❌ Unknown argument: {sys.argv[i]}")
-            print("💡 Usage: python script.py [--contact 'Name'] [--limit 100]")
+            print("💡 Usage: python script.py [--contact 'Name'] [--limit 100] [--recent]")
             return
     
     try:
@@ -813,7 +985,9 @@ def main():
     # Single contact export
     if contact_name:
         print(f"🎯 Single contact export: {contact_name}")
-        result = exporter.export_conversation(contact_name, None, limit)
+        if recent:
+            print("📅 Showing recent messages first")
+        result = exporter.export_conversation(contact_name, None, limit, recent)
         
         if result:
             print(f"\n🎉 Export successful!")
@@ -841,7 +1015,7 @@ def main():
         print(f"\n📝 [{i}/{len(contacts)}] Exporting: {contact['name']}")
         print(f"   📊 Has {contact['reaction_count']} reaction messages")
         
-        result = exporter.export_conversation(contact['jid'], None, limit)
+        result = exporter.export_conversation(contact['jid'], None, limit, False)
         
         if result:
             exported_files.append({
