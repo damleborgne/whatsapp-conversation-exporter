@@ -10,9 +10,9 @@ This version specifically uses the local database file.
 
 Usage:
     python whatsapp_conversation_exporter_local.py
-    python whatsapp_conversation_exporter_local.py --contact "Laure de Verdalle"
+    python whatsapp_conversation_exporter_local.py --contact "John Doe"
 
-Author: AI Assistant  
+Author: Damien Le Borgne & AI Assistant
 Date: August 2025
 """
 
