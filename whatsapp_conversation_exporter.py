@@ -867,19 +867,24 @@ class WhatsAppExporter:
             
             # Handle quoted messages
             if msg.get('quoted_text'):
-                output.append(f"[{time_part}] {prefix}")
-                
                 citation = msg.get('quoted_text')
+                
+                # Format citation directly after timestamp
                 if isinstance(citation, ForwardInfo):
-                    output.append(f"    ↳ (forwarded id {citation.hash_id})")
+                    citation_line = f"[{time_part}] ↳ (forwarded id {citation.hash_id})"
                 else:
                     lines = citation.split('\n')
-                    if len(lines) == 1:
-                        output.append(f"    ↳ {lines[0]}")
-                    else:
-                        output.append(f"    ↳ {lines[0]}")
+                    citation_line = f"[{time_part}] ↳ {lines[0]}"
+                    
+                output.append(citation_line)
+                
+                # Add additional citation lines if multi-line
+                if not isinstance(citation, ForwardInfo):
+                    lines = citation.split('\n')
+                    if len(lines) > 1:
                         for extra in lines[1:]:
-                            output.append(f"       {extra}")
+                            # Indent to align with the arrow
+                            output.append(f"           {extra}")
                 
                 # Handle media in quoted messages
                 if msg.get('media_info'):
@@ -892,9 +897,9 @@ class WhatsAppExporter:
                     # Use markdown link format for better VS Code support
                     if media_path:
                         filename = os.path.basename(media_path)
-                        media_line = f"    📎 {media_type}: [{filename}](./{media_path})"
+                        media_line = f"           📎 {media_type}: [{filename}](./{media_path})"
                     else:
-                        media_line = f"    📎 {media_type}: [Not downloaded]"
+                        media_line = f"           📎 {media_type}: [Not downloaded]"
                     
                     if size_kb > 0:
                         media_line += f" ({size_kb} KB)"
@@ -902,10 +907,12 @@ class WhatsAppExporter:
                         media_line += f" - {msg['media_info']['title']}"
                     output.append(media_line)
                 
-                message_line = f"    {sender_prefix}{msg['content'] or ''}"
-                if msg['reaction_emoji']:
-                    message_line += f" {msg['reaction_emoji']}"
-                if message_line.strip() != f"    {sender_prefix}":  # Only add if there's actual content
+                # Add the reply message below with proper indentation and sender prefix
+                reply_content = msg['content'] or ''
+                if reply_content.strip():
+                    message_line = f"           {prefix} {sender_prefix}{reply_content}"
+                    if msg['reaction_emoji']:
+                        message_line += f" {msg['reaction_emoji']}"
                     output.append(message_line)
             else:
                 # Regular message - handle media first, then text
