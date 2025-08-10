@@ -279,22 +279,70 @@ class WhatsAppExporter:
             print(f"❌ Error getting contacts: {e}")
             return []
     
+    def get_all_contacts(self):
+        """Get all contacts and groups."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT ZCONTACTJID, ZPARTNERNAME
+                    FROM ZWACHATSESSION 
+                    WHERE ZCONTACTJID IS NOT NULL
+                    AND ZPARTNERNAME IS NOT NULL
+                    AND ZPARTNERNAME != ''
+                    ORDER BY ZPARTNERNAME
+                """)
+                
+                contacts = []
+                for jid, name in cursor.fetchall():
+                    if jid and name:
+                        contacts.append({
+                            'jid': jid,
+                            'name': name,
+                            'reaction_count': 0  # Default value
+                        })
+                return contacts
+        except Exception as e:
+            print(f"❌ Error getting all contacts: {e}")
+            return []
+    
     def get_conversation(self, contact_jid, limit=None):
         """Get conversation with all features."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 
-                query = """
-                    SELECT 
-                        m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
-                        m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM
-                    FROM ZWAMESSAGE m
-                    LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
-                    WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
-                    AND m.ZMESSAGETYPE = 0 AND m.ZTEXT IS NOT NULL AND m.ZTEXT != ''
-                    ORDER BY m.ZMESSAGEDATE ASC
-                """
+                # Check if this is a group conversation
+                is_group = contact_jid.endswith('@g.us')
+                
+                if is_group:
+                    # Group conversation query with sender names
+                    query = """
+                        SELECT 
+                            m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
+                            m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM,
+                            cs.ZPARTNERNAME, gm.ZMEMBERJID
+                        FROM ZWAMESSAGE m
+                        LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
+                        LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
+                        LEFT JOIN ZWACHATSESSION cs ON gm.ZMEMBERJID = cs.ZCONTACTJID
+                        WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
+                        AND m.ZMESSAGETYPE = 0 AND m.ZTEXT IS NOT NULL AND m.ZTEXT != ''
+                        ORDER BY m.ZMESSAGEDATE ASC
+                    """
+                else:
+                    # Individual conversation query
+                    query = """
+                        SELECT 
+                            m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
+                            m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM,
+                            NULL, NULL
+                        FROM ZWAMESSAGE m
+                        LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
+                        WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
+                        AND m.ZMESSAGETYPE = 0 AND m.ZTEXT IS NOT NULL AND m.ZTEXT != ''
+                        ORDER BY m.ZMESSAGEDATE ASC
+                    """
                 
                 if limit:
                     query += f" LIMIT {limit}"
@@ -324,6 +372,11 @@ class WhatsAppExporter:
                     flags = row[6] or 0
                     is_forwarded = bool(flags & 0x180 == 0x180)
                     
+                    # For groups, get sender name
+                    sender_name = None
+                    if is_group and not bool(row[5]):  # Not from me
+                        sender_name = row[10]  # ZPARTNERNAME from the join
+                    
                     message = {
                         'message_id': row[0],
                         'content': row[1],
@@ -335,6 +388,7 @@ class WhatsAppExporter:
                         'parent_message_id': row[8],
                         'quoted_text': quoted_text,
                         'is_forwarded': is_forwarded,
+                        'sender_name': sender_name,
                         '_media_item_id': row[9]
                     }
                     self.messages.append(message)
@@ -410,6 +464,11 @@ class WhatsAppExporter:
             
             prefix = ">" if msg['is_from_me'] else "<"
             
+            # For group messages, add sender name
+            sender_prefix = ""
+            if msg.get('sender_name') and not msg['is_from_me']:
+                sender_prefix = f"{msg['sender_name']}: "
+            
             # Handle quoted messages
             if msg.get('quoted_text'):
                 output.append(f"[{time_part}] {prefix}")
@@ -426,7 +485,7 @@ class WhatsAppExporter:
                         for extra in lines[1:]:
                             output.append(f"       {extra}")
                 
-                message_line = f"    {msg['content']}"
+                message_line = f"    {sender_prefix}{msg['content']}"
                 if msg['reaction_emoji']:
                     message_line += f" [{msg['reaction_emoji']}]"
                 output.append(message_line)
@@ -435,7 +494,7 @@ class WhatsAppExporter:
                 content = msg['content']
                 if msg.get('is_forwarded'):
                     content = f"(forward) {content}"
-                message_line = f"[{time_part}] {prefix} {content}"
+                message_line = f"[{time_part}] {prefix} {sender_prefix}{content}"
                 if msg['reaction_emoji']:
                     message_line += f" [{msg['reaction_emoji']}]"
                 output.append(message_line)
@@ -474,7 +533,7 @@ class WhatsAppExporter:
             print(f"📁 Created directory: {conversations_dir}")
         
         # Find contact
-        contacts = self.get_contacts_with_reactions()
+        contacts = self.get_all_contacts()
         target_contact = None
         
         for contact in contacts:
@@ -486,7 +545,9 @@ class WhatsAppExporter:
         if not target_contact:
             print(f"❌ Contact '{contact_name_or_jid}' not found.")
             print("Available contacts with reactions:")
-            for i, contact in enumerate(contacts[:10], 1):
+            # Show contacts with reactions for fallback
+            reaction_contacts = self.get_contacts_with_reactions()
+            for i, contact in enumerate(reaction_contacts[:10], 1):
                 print(f"  {i}. {contact['name']}")
             return None
         
@@ -565,15 +626,15 @@ def main():
             print("❌ Export failed")
         return
     
-    # Export all contacts with reactions
-    print("🔍 Getting contacts with reactions...")
-    contacts = exporter.get_contacts_with_reactions()
+    # Export all contacts and groups
+    print("🔍 Getting all contacts and groups...")
+    contacts = exporter.get_all_contacts()
     
     if not contacts:
-        print("❌ No contacts with reactions found.")
+        print("❌ No contacts found.")
         return
     
-    print(f"📊 Found {len(contacts)} contacts with reactions")
+    print(f"📊 Found {len(contacts)} contacts and groups")
     print("=" * 60)
     
     # Export each contact
