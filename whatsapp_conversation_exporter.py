@@ -336,7 +336,9 @@ class WhatsAppConversationExporter:
                                         # Remove only trailing control characters (systematic)
                                         import re
                                         quoted_text = re.sub(r'[\x00-\x1f]+$', '', quoted_text).strip()
-                                        
+                                        # Remove also leading control characters
+                                        quoted_text = re.sub(r'^[\x00-\x1f]+', '', quoted_text)
+
                                         if quoted_text:
                                             # SYSTEMATIC ACCEPTANCE: SEULEMENT Tag 1 pour les citations  
                                             if tag == 1 and len(quoted_text) > 10:
