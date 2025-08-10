@@ -666,12 +666,15 @@ class WhatsAppExporter:
                     # Handle media
                     media_info = None
                     if row[9]:  # has media_item_id
-                        media_info = {
-                            'local_path': row[13],
-                            'title': row[14],
-                            'file_size': row[15],
-                            'message_type': row[12]
-                        }
+                        # Only create media_info if there's actual media content
+                        # (local_path exists, or file_size > 0, or title exists)
+                        if row[13] or (row[15] and row[15] > 0) or (row[14] and row[14].strip()):
+                            media_info = {
+                                'local_path': row[13],
+                                'title': row[14],
+                                'file_size': row[15],
+                                'message_type': row[12]
+                            }
                     
                     message = {
                         'message_id': row[0],
