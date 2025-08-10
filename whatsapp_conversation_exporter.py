@@ -296,8 +296,8 @@ class WhatsAppExporter:
         """Get human-readable media type name."""
         media_types = {
             1: "Image",
-            2: "Audio", 
-            3: "Video",
+            2: "Video",  # MP4 files
+            3: "Audio",  # Audio files
             5: "Location",
             9: "Document",
             13: "GIF",
