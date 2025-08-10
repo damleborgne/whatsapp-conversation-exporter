@@ -26,11 +26,40 @@ class ForwardInfo:
 
 
 class WhatsAppExporter:
-    def __init__(self, db_path=None):
-        """Initialize with WhatsApp database."""
-        self.db_path = db_path or self._find_database()
+    def __init__(self, db_path=None, backup_mode=False, backup_base_path=None):
+        """Initialize with WhatsApp database.
+        
+        Args:
+            db_path: Custom database path
+            backup_mode: Use iOS backup extracted by wtsexporter instead of local WhatsApp
+            backup_base_path: Base path for wtsexporter output (default: ../working_wts)
+        """
+        self.backup_mode = backup_mode
+        self.backup_base_path = backup_base_path or "../working_wts"
+        
+        if backup_mode:
+            self.db_path = db_path or self._find_backup_database()
+            self.media_base_path = os.path.join(self.backup_base_path, "AppDomainGroup-group.net.whatsapp.WhatsApp.shared/Message/Media")
+        else:
+            self.db_path = db_path or self._find_database()
+            self.media_base_path = os.path.expanduser("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Message")
+            
         self.contact_cache = {}
         print(f"📁 Database: {self.db_path}")
+        print(f"📂 Media base: {self.media_base_path}")
+    
+    def _find_backup_database(self):
+        """Find wtsexporter database."""
+        backup_db_path = os.path.join(self.backup_base_path, "7c7fba66680ef796b916b067077cc246adacf01d")
+        
+        print("🔍 Looking for wtsexporter database...")
+        
+        if os.path.exists(backup_db_path):
+            print(f"✅ Found backup database: {backup_db_path}")
+            return backup_db_path
+        else:
+            print(f"⚠️ Using backup path: {backup_db_path}")
+            return backup_db_path
     
     def _find_database(self):
         """Find WhatsApp database."""
@@ -333,12 +362,17 @@ class WhatsAppExporter:
         relative_path = f"media/{safe_contact_name}/{filename}"
         full_target_path = f"conversations/{relative_path}"
         
-        # Try to copy the file if it exists
-        whatsapp_media_dir = os.path.expanduser("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/")
-        full_source_path = os.path.join(whatsapp_media_dir, "Message", original_path)
+        # Determine source path based on mode
+        if self.backup_mode:
+            # For backup mode, media are organized by contact JID
+            # Extract contact JID from the path or use a mapping
+            full_source_path = self._get_backup_media_path(original_path, contact_name)
+        else:
+            # Local WhatsApp mode
+            full_source_path = os.path.join(self.media_base_path, original_path)
         
         try:
-            if os.path.exists(full_source_path) and not os.path.exists(full_target_path):
+            if full_source_path and os.path.exists(full_source_path) and not os.path.exists(full_target_path):
                 import shutil
                 shutil.copy2(full_source_path, full_target_path)
                 print(f"   📎 Copied media: {filename}")
@@ -350,6 +384,67 @@ class WhatsAppExporter:
             print(f"   ⚠️ Could not copy media {filename}: {e}")
         
         return relative_path
+    
+    def _get_backup_media_path(self, original_path, contact_name):
+        """Get backup media path for wtsexporter extracted files."""
+        # In backup mode, we need to find the contact JID and map it to the media path
+        # The original_path might be like: "Media/33689523939-1443423912@g.us/b/3/filename.jpg"
+        # But in backup extraction, it's organized by contact JID: "33614712671@s.whatsapp.net/filename.jpg"
+        
+        # Extract filename from original path
+        filename = os.path.basename(original_path)
+        if not filename:
+            return None
+        
+        # We need to find the contact JID for this contact name
+        # This is a simplified approach - in real usage, you might need a more sophisticated mapping
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                # Find contact JID by name
+                cursor.execute("SELECT ZCONTACTJID FROM ZWACHATSESSION WHERE ZPARTNERNAME = ?", (contact_name,))
+                result = cursor.fetchone()
+                if result:
+                    contact_jid = result[0]
+                    # For groups, convert group JID to individual JID pattern
+                    if '@g.us' in contact_jid:
+                        # Group - use group JID as folder name
+                        jid_folder = contact_jid
+                    else:
+                        # Individual contact - use contact JID
+                        jid_folder = contact_jid
+                    
+                    # Try to find the file in the backup media structure
+                    possible_paths = [
+                        os.path.join(self.media_base_path, jid_folder, filename),
+                        os.path.join(self.media_base_path, contact_jid, filename),
+                        # If direct mapping fails, try to find it by scanning
+                    ]
+                    
+                    for path in possible_paths:
+                        if os.path.exists(path):
+                            return path
+                    
+                    # Last resort: scan the media directory for the filename
+                    return self._find_media_in_backup(filename)
+        except Exception:
+            pass
+        
+        return None
+    
+    def _find_media_in_backup(self, filename):
+        """Find media file in backup directory by scanning."""
+        if not os.path.exists(self.media_base_path):
+            return None
+        
+        try:
+            for root, dirs, files in os.walk(self.media_base_path):
+                if filename in files:
+                    return os.path.join(root, filename)
+        except Exception:
+            pass
+        
+        return None
     
     def _extract_quoted_text(self, cursor, media_item_id):
         """Extract quoted text from media metadata."""
@@ -962,6 +1057,8 @@ def main():
     contact_name = None
     limit = None
     recent = False
+    backup_mode = False
+    backup_path = None
     
     i = 1
     while i < len(sys.argv):
@@ -974,13 +1071,30 @@ def main():
         elif sys.argv[i] == "--recent":
             recent = True
             i += 1
+        elif sys.argv[i] == "--backup":
+            backup_mode = True
+            i += 1
+        elif sys.argv[i] == "--backup-path" and i + 1 < len(sys.argv):
+            backup_path = sys.argv[i + 1]
+            backup_mode = True
+            i += 2
         else:
             print(f"❌ Unknown argument: {sys.argv[i]}")
-            print("💡 Usage: python script.py [--contact 'Name'] [--limit 100] [--recent]")
+            print("💡 Usage: python script.py [--contact 'Name'] [--limit 100] [--recent] [--backup] [--backup-path 'path']")
+            print("   --backup: Use wtsexporter backup instead of local WhatsApp")
+            print("   --backup-path: Path to wtsexporter output directory (default: ../working_wts)")
             return
     
+    # Display mode information
+    if backup_mode:
+        print(f"🔄 Using backup mode with wtsexporter data")
+        if backup_path:
+            print(f"📂 Backup path: {backup_path}")
+    else:
+        print(f"📱 Using local WhatsApp mode")
+    
     try:
-        exporter = WhatsAppExporter()
+        exporter = WhatsAppExporter(backup_mode=backup_mode, backup_base_path=backup_path)
     except Exception as e:
         print(f"❌ Failed to initialize exporter: {e}")
         return
