@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-WhatsApp Conversation Exporter with Reactions - Local Database Version
-======================================================================
+WhatsApp Conversation Exporter - Simplified Version
+==================================================
 
-This script exports WhatsApp conversations to text files, including emoji reactions
-appended to each message in the format "[emoji]".
-
-This version specifically uses the local database file.
+Exports WhatsApp conversations with citations, forwards, and reactions.
 
 Usage:
-    python whatsapp_conversation_exporter_local.py
-    python whatsapp_conversation_exporter_local.py --contact "John Doe"
+    python whatsapp_conversation_exporter.py --contact "Name"
+    python whatsapp_conversation_exporter.py --limit 100
 
 Author: Damien Le Borgne & AI Assistant
 Date: August 2025
@@ -19,233 +16,284 @@ Date: August 2025
 import sqlite3
 import os
 import sys
+import re
 from datetime import datetime
 
 
-# ForwardInfo helper class for forwarded message hash placeholders
 class ForwardInfo:
-    def __init__(self, hash_id: str):
+    def __init__(self, hash_id):
         self.hash_id = hash_id
 
 
-class WhatsAppReactionExtractor:
-    """Local version of the reaction extractor for the specific database."""
-    
+class WhatsAppExporter:
     def __init__(self, db_path=None):
-        """Initialize with WhatsApp database path."""
-        if db_path is None:
-            self.db_path = self._find_whatsapp_database()
-        else:
-            self.db_path = db_path
+        """Initialize with WhatsApp database."""
+        self.db_path = db_path or self._find_database()
         self.contact_cache = {}
-        print(f"📁 Database path: {self.db_path}")
+        print(f"📁 Database: {self.db_path}")
     
-    def _find_whatsapp_database(self):
-        """Find the WhatsApp database, trying standard location first."""
-        # Standard WhatsApp location on macOS
+    def _find_database(self):
+        """Find WhatsApp database."""
         standard_path = os.path.expanduser("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite")
-        
-        # Fallback to specific database file
         fallback_path = "7c7fba66680ef796b916b067077cc246adacf01d"
         
         print("🔍 Looking for WhatsApp database...")
         
-        # Try standard location first
         if os.path.exists(standard_path):
-            print(f"✅ Found standard WhatsApp database: {standard_path}")
+            print(f"✅ Found database: {standard_path}")
             return standard_path
-        else:
-            print(f"❌ Standard location not found: {standard_path}")
-        
-        # Try fallback location
-        if os.path.exists(fallback_path):
-            print(f"✅ Found fallback database: {fallback_path}")
+        elif os.path.exists(fallback_path):
+            print(f"✅ Found database: {fallback_path}")
             return fallback_path
         else:
-            print(f"❌ Fallback location not found: {fallback_path}")
-        
-        # If neither found, return standard path anyway (might work with permissions)
-        print(f"⚠️  Using standard path (may require WhatsApp to be running): {standard_path}")
-        return standard_path
+            print(f"⚠️ Using standard path: {standard_path}")
+            return standard_path
     
     def _get_contact_name(self, jid):
-        """Get contact name from JID using the ZWACHATSESSION table."""
-        if not jid:
-            return "Unknown"
-            
-        if jid in self.contact_cache:
-            return self.contact_cache[jid]
+        """Get contact name from JID."""
+        if not jid or jid in self.contact_cache:
+            return self.contact_cache.get(jid, "Unknown")
         
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                
-                cursor.execute("""
-                    SELECT ZPARTNERNAME 
-                    FROM ZWACHATSESSION 
-                    WHERE ZCONTACTJID = ?
-                """, (jid,))
-                
+                cursor.execute("SELECT ZPARTNERNAME FROM ZWACHATSESSION WHERE ZCONTACTJID = ?", (jid,))
                 result = cursor.fetchone()
+                
                 if result and result[0]:
                     name = result[0]
-                    self.contact_cache[jid] = name
-                    return name
                 else:
-                    if '@' in jid:
-                        phone_part = jid.split('@')[0]
-                        formatted_name = f"Contact ({phone_part})"
-                        self.contact_cache[jid] = formatted_name
-                        return formatted_name
-                    else:
-                        self.contact_cache[jid] = jid
-                        return jid
-                        
-        except sqlite3.Error as e:
-            print(f"Error getting contact name: {e}")
+                    name = f"Contact ({jid.split('@')[0]})" if '@' in jid else jid
+                
+                self.contact_cache[jid] = name
+                return name
+        except Exception:
             self.contact_cache[jid] = jid
             return jid
     
+    def _convert_timestamp(self, timestamp):
+        """Convert WhatsApp timestamp."""
+        if not timestamp:
+            return None
+        try:
+            return datetime.fromtimestamp(timestamp + 978307200).strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            return None
+    
+    def _decode_reaction(self, blob):
+        """Decode emoji reaction from blob."""
+        if not blob:
+            return None
+        try:
+            hex_data = blob.hex().lower()
+            if 'f09f' in hex_data:
+                matches = re.findall(r'f09f[0-9a-f]{4}', hex_data)
+                if matches:
+                    return bytes.fromhex(matches[0]).decode('utf-8')
+            if 'e29da4' in hex_data:
+                return '❤️'
+        except Exception:
+            pass
+        return None
+    
+    def _extract_quoted_text(self, cursor, media_item_id):
+        """Extract quoted text from media metadata."""
+        try:
+            cursor.execute("SELECT ZMETADATA FROM ZWAMEDIAITEM WHERE Z_PK = ?", (media_item_id,))
+            result = cursor.fetchone()
+            if not result or not result[0]:
+                return None
+            
+            blob = result[0]
+            i = 0
+            
+            while i < len(blob) - 2:
+                tag_byte = blob[i]
+                if (tag_byte & 0x7) == 2:  # Length-delimited field
+                    tag = tag_byte >> 3
+                    length = blob[i + 1]
+                    
+                    if i + 2 + length <= len(blob) and length > 2 and tag == 1:
+                        field_data = blob[i + 2:i + 2 + length]
+                        try:
+                            text = field_data.decode('utf-8', errors='ignore').strip()
+                            text = re.sub(r'[\x00-\x1f]+', '', text)
+                            
+                            if len(text) > 3:
+                                # Check for forward hash
+                                sanitized = re.sub(r"[^A-Za-z0-9'`{}]", "", text)
+                                if (re.fullmatch(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", sanitized) and
+                                    any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in sanitized)):
+                                    return ForwardInfo(sanitized)
+                                
+                                # Regular quote
+                                if ' ' in text and len(text) > 10:
+                                    if len(text) > 50:
+                                        words = text[:50].split()
+                                        text = ' '.join(words[:-1]) + "..." if len(words) > 1 else text[:50] + "..."
+                                    return text
+                        except Exception:
+                            pass
+                    
+                    i += 2 + length if i + 2 + length <= len(blob) else i + 1
+                else:
+                    i += 1
+            
+            # Fallback: scan for forward hash
+            try:
+                raw_ascii = ''.join(chr(b) if 32 <= b < 127 else ' ' for b in blob)
+                candidates = re.findall(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", raw_ascii)
+                for cand in candidates:
+                    if any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in cand):
+                        return ForwardInfo(cand)
+            except Exception:
+                pass
+            
+            return None
+        except Exception:
+            return None
+    
+    def _parse_metadata_replies(self, cursor, targets):
+        """Parse metadata to find reply relationships."""
+        if not targets:
+            return
+        
+        # Get metadata
+        media_ids = [m['_media_item_id'] for m in targets if m.get('_media_item_id')]
+        if not media_ids:
+            return
+        
+        placeholders = ','.join(['?'] * len(media_ids))
+        cursor.execute(f"SELECT Z_PK,ZMETADATA FROM ZWAMEDIAITEM WHERE Z_PK IN ({placeholders})", media_ids)
+        meta_map = {r[0]: r[1] for r in cursor.fetchall() if r[1]}
+        
+        # Index original messages
+        originals = {}
+        for m in self.messages:
+            text = (m.get('content') or '').strip()
+            if len(text) >= 40:
+                originals.setdefault(text[:60], []).append(m)
+        
+        # Process targets
+        for msg in targets:
+            blob = meta_map.get(msg.get('_media_item_id'))
+            if not blob:
+                continue
+            
+            # Extract fragments from tags 5,6,9,13,14
+            parts = []
+            i = 0
+            while i < len(blob) - 2:
+                b = blob[i]
+                if (b & 7) == 2 and i + 1 < len(blob):
+                    tag = b >> 3
+                    length = blob[i + 1]
+                    data = blob[i + 2:i + 2 + length]
+                    i += 2 + length
+                    
+                    if 10 < length < 130 and tag in (5, 6, 9, 13, 14):
+                        try:
+                            text = data.decode('utf-8', 'ignore').strip()
+                            if text:
+                                parts.append(text)
+                        except:
+                            pass
+                else:
+                    i += 1
+            
+            if len(parts) < 2:
+                continue
+            
+            # Find matching original
+            reconstruction = ' '.join(parts)
+            best_match = None
+            best_delta = None
+            
+            for key, candidates in originals.items():
+                match_found = any(len(part) > 15 and part in key for part in parts)
+                if not match_found and key[:25] in reconstruction:
+                    match_found = True
+                
+                if match_found:
+                    for candidate in candidates:
+                        if (candidate.get('is_from_me') == msg.get('is_from_me') or
+                            not candidate.get('date') or not msg.get('date')):
+                            continue
+                        
+                        try:
+                            t1 = datetime.strptime(candidate['date'], '%Y-%m-%d %H:%M:%S')
+                            t2 = datetime.strptime(msg['date'], '%Y-%m-%d %H:%M:%S')
+                            if t1 >= t2:
+                                continue
+                            
+                            delta = (t2 - t1).total_seconds()
+                            if delta > 48 * 3600:
+                                continue
+                            
+                            if best_delta is None or delta < best_delta:
+                                best_match = candidate
+                                best_delta = delta
+                        except:
+                            continue
+            
+            # Apply quote
+            if best_match and not msg.get('quoted_text'):
+                content = best_match['content']
+                if len(content) > 90:
+                    words = content[:90].split()
+                    content = ' '.join(words[:-1]) + '...' if len(words) > 1 else content[:85] + '...'
+                msg['quoted_text'] = content
+    
+                msg['quoted_text'] = content
+    
     def get_contacts_with_reactions(self):
-        """Get all contacts who have messages with reactions."""
+        """Get contacts with reactions."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                
                 cursor.execute("""
                     SELECT 
-                        CASE 
-                            WHEN ZWAMESSAGE.ZISFROMME = 1 THEN ZWAMESSAGE.ZTOJID
-                            ELSE ZWAMESSAGE.ZFROMJID
-                        END as contact_jid,
+                        CASE WHEN m.ZISFROMME = 1 THEN m.ZTOJID ELSE m.ZFROMJID END as contact_jid,
                         COUNT(*) as reaction_count
-                    FROM ZWAMESSAGE  
-                    JOIN ZWAMESSAGEINFO ON ZWAMESSAGE.Z_PK = ZWAMESSAGEINFO.ZMESSAGE  
-                    WHERE ZWAMESSAGE.ZMESSAGETYPE = 0 
-                    AND ZWAMESSAGEINFO.ZRECEIPTINFO IS NOT NULL
-                    AND LENGTH(ZWAMESSAGEINFO.ZRECEIPTINFO) > 50
-                    AND (
-                        HEX(ZWAMESSAGEINFO.ZRECEIPTINFO) LIKE '%F09F%' OR
-                        HEX(ZWAMESSAGEINFO.ZRECEIPTINFO) LIKE '%E2%'
-                    )
-                    AND (ZWAMESSAGE.ZFROMJID LIKE '%@s.whatsapp.net' OR ZWAMESSAGE.ZTOJID LIKE '%@s.whatsapp.net')
+                    FROM ZWAMESSAGE m
+                    JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
+                    WHERE m.ZMESSAGETYPE = 0 
+                    AND i.ZRECEIPTINFO IS NOT NULL
+                    AND LENGTH(i.ZRECEIPTINFO) > 50
+                    AND (HEX(i.ZRECEIPTINFO) LIKE '%F09F%' OR HEX(i.ZRECEIPTINFO) LIKE '%E2%')
+                    AND (m.ZFROMJID LIKE '%@s.whatsapp.net' OR m.ZTOJID LIKE '%@s.whatsapp.net')
                     GROUP BY contact_jid
                     ORDER BY reaction_count DESC
                 """)
                 
-                contacts_with_reactions = []
-                for row in cursor.fetchall():
-                    jid, count = row
+                contacts = []
+                for jid, count in cursor.fetchall():
                     if jid:
-                        name = self._get_contact_name(jid)
-                        contacts_with_reactions.append({
+                        contacts.append({
                             'jid': jid,
-                            'name': name,
+                            'name': self._get_contact_name(jid),
                             'reaction_count': count
                         })
-                
-                return contacts_with_reactions
-                
-        except sqlite3.Error as e:
-            print(f"❌ Error getting contacts with reactions: {e}")
+                return contacts
+        except Exception as e:
+            print(f"❌ Error getting contacts: {e}")
             return []
     
-    def _extract_emoji_from_hex(self, hex_data):
-        """Extract emoji from hexadecimal data using generic UTF-8 decoding."""
-        hex_lower = hex_data.lower()
-        
-        if 'f09f' in hex_lower:
-            try:
-                import re
-                emoji_pattern = r'f09f[0-9a-f]{4}'
-                matches = re.findall(emoji_pattern, hex_lower)
-                
-                if matches:
-                    emoji_bytes = bytes.fromhex(matches[0])
-                    return emoji_bytes.decode('utf-8')
-            except Exception:
-                pass
-        
-        if 'e29da4' in hex_lower:
-            return '❤️'
-        
-        return None
-    
-    def _decode_reaction_blob(self, blob_data):
-        """Decode reaction blob using pure hex analysis."""
-        if not blob_data:
-            return None
-            
-        try:
-            hex_data = blob_data.hex()
-            emoji_found = self._extract_emoji_from_hex(hex_data)
-            
-            if emoji_found:
-                return {
-                    'type': 'potential_reaction',
-                    'detected_emoji': emoji_found,
-                    'hex_data': hex_data,
-                    'blob_size': len(blob_data)
-                }
-            else:
-                return {
-                    'type': 'receipt_only',
-                    'hex_data': hex_data,
-                    'blob_size': len(blob_data)
-                }
-            
-        except Exception as e:
-            return {
-                'error': str(e),
-                'raw_blob_size': len(blob_data),
-                'hex_preview': blob_data.hex()[:50]
-            }
-    
-    def _convert_timestamp(self, timestamp):
-        """Convert WhatsApp timestamp to readable format."""
-        if not timestamp:
-            return None
-        try:
-            timestamp = timestamp + 978307200  # Add seconds from 1970 to 2001
-            return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
-        except Exception as e:
-            return f"Invalid timestamp: {timestamp} ({e})"
-
-
-class WhatsAppConversationExporter:
-    """Export WhatsApp conversations with reactions to text files."""
-    
-    def __init__(self, db_path=None):
-        """Initialize with WhatsApp database."""
-        self.extractor = WhatsAppReactionExtractor(db_path)
-        self.db_path = self.extractor.db_path
-    
-    def get_conversation_with_reactions(self, contact_jid, limit=None):
-        """Get complete conversation with a contact, including reactions and quotes."""
+    def get_conversation(self, contact_jid, limit=None):
+        """Get conversation with all features."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 
                 query = """
-                SELECT  
-                    ZWAMESSAGE.Z_PK AS message_id,
-                    ZWAMESSAGE.ZTEXT AS message_content,
-                    ZWAMESSAGE.ZMESSAGEDATE AS message_date,
-                    ZWAMESSAGE.ZFROMJID AS from_jid,
-                    ZWAMESSAGE.ZTOJID AS to_jid,
-                    ZWAMESSAGE.ZISFROMME AS is_from_me,
-                    ZWAMESSAGE.ZFLAGS AS flags,
-                    ZWAMESSAGE.ZMESSAGETYPE AS message_type,
-                    ZWAMESSAGEINFO.ZRECEIPTINFO AS reaction_blob,
-                    ZWAMESSAGE.ZPARENTMESSAGE AS parent_message_id,
-                    ZWAMESSAGE.ZMEDIAITEM AS media_item_id
-                FROM ZWAMESSAGE  
-                LEFT JOIN ZWAMESSAGEINFO ON ZWAMESSAGE.Z_PK = ZWAMESSAGEINFO.ZMESSAGE
-                WHERE (ZWAMESSAGE.ZFROMJID = ? OR ZWAMESSAGE.ZTOJID = ?)
-                AND ZWAMESSAGE.ZMESSAGETYPE = 0
-                AND ZWAMESSAGE.ZTEXT IS NOT NULL
-                AND ZWAMESSAGE.ZTEXT != ''
-                ORDER BY ZWAMESSAGE.ZMESSAGEDATE ASC
+                    SELECT 
+                        m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
+                        m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM
+                    FROM ZWAMESSAGE m
+                    LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
+                    WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
+                    AND m.ZMESSAGETYPE = 0 AND m.ZTEXT IS NOT NULL AND m.ZTEXT != ''
+                    ORDER BY m.ZMESSAGEDATE ASC
                 """
                 
                 if limit:
@@ -254,406 +302,81 @@ class WhatsAppConversationExporter:
                 cursor.execute(query, (contact_jid, contact_jid))
                 rows = cursor.fetchall()
                 
-                print(f"📋 Found {len(rows)} messages in conversation...")
+                print(f"📋 Found {len(rows)} messages...")
                 
-                # First pass: collect all messages
-                messages = []
+                # Collect all messages
+                self.messages = []
                 message_lookup = {}
                 
                 for row in rows:
-                    # Decode reaction if present
+                    # Decode reaction
                     reaction_emoji = None
-                    if row[8]:  # reaction_blob exists (index shifted by insertion of flags)
-                        reaction_data = self.extractor._decode_reaction_blob(row[8])
-                        if (reaction_data and 
-                            reaction_data.get('type') == 'potential_reaction' and
-                            'detected_emoji' in reaction_data):
-                            reaction_emoji = reaction_data['detected_emoji']
+                    if row[7]:
+                        reaction_emoji = self._decode_reaction(row[7])
                     
-                    # Extract quoted text from MediaItem metadata if present
-                    # Use intelligent validation to distinguish real citations from binary artifacts
+                    # Extract quoted text
                     quoted_text = None
-                    if row[10]:  # media_item_id exists
-                        quoted_text = self._extract_quoted_text_from_media(cursor, row[10])
-
-                    # If metadata produced a ForwardInfo but there is an explicit parent message id, treat it as a normal reply (use parent snippet later)
-                    if isinstance(quoted_text, ForwardInfo) and row[9]:
-                        quoted_text = None
-
+                    if row[9]:  # media_item_id
+                        quoted_text = self._extract_quoted_text(cursor, row[9])
+                        if isinstance(quoted_text, ForwardInfo) and row[8]:  # parent_message_id exists
+                            quoted_text = None
+                    
                     flags = row[6] or 0
-                    is_forwarded_flag = bool(flags & 0x180 == 0x180)
+                    is_forwarded = bool(flags & 0x180 == 0x180)
                     
                     message = {
                         'message_id': row[0],
                         'content': row[1],
-                        'date': self.extractor._convert_timestamp(row[2]),
+                        'date': self._convert_timestamp(row[2]),
                         'from_jid': row[3],
                         'to_jid': row[4],
                         'is_from_me': bool(row[5]),
                         'reaction_emoji': reaction_emoji,
-                        'parent_message_id': row[9],
+                        'parent_message_id': row[8],
                         'quoted_text': quoted_text,
-                        'is_forwarded': is_forwarded_flag
+                        'is_forwarded': is_forwarded,
+                        '_media_item_id': row[9]
                     }
-                    messages.append(message)
+                    self.messages.append(message)
                     message_lookup[message['message_id']] = message
                 
-                # Build mapping media_item_id -> message for metadata-based reply inference
-                media_to_message = {}
-                for m in messages:
-                    mid = None
-                    # We didn't store media_item_id earlier; re-query minimal mapping for this batch (optimization skipped for clarity)
-                    # Add lightweight cache: message_lookup already; fetch media ids in one query
-                # Pre-fetch media ids for all message ids to avoid altering initial select
-                try:
-                    ids_tuple = tuple(msg['message_id'] for msg in messages)
-                    if ids_tuple:
-                        ph = ','.join(['?']*len(ids_tuple))
-                        cursor.execute(f"SELECT Z_PK,ZMEDIAITEM FROM ZWAMESSAGE WHERE Z_PK IN ({ph})", ids_tuple)
-                        mw = {r[0]: r[1] for r in cursor.fetchall()}
-                        for m in messages:
-                            m['_media_item_id'] = mw.get(m['message_id'])
-                except Exception:
-                    pass
-
-                # Second pass: resolve quoted messages via ZPARENTMESSAGE (fallback)
-                for message in messages:
-                    if not message['quoted_text'] and message['parent_message_id'] and message['parent_message_id'] in message_lookup:
+                # Resolve parent message quotes
+                for message in self.messages:
+                    if (not message['quoted_text'] and message['parent_message_id'] 
+                        and message['parent_message_id'] in message_lookup):
                         parent_msg = message_lookup[message['parent_message_id']]
-                        # Extract first 50 characters of quoted message
                         quoted_content = parent_msg['content'][:50]
                         if len(parent_msg['content']) > 50:
                             quoted_content += "..."
                         message['quoted_text'] = quoted_content
-
-                # Systematic metadata-based reconstruction: extract quoted text from protobuf metadata fields
-                try:
-                    import datetime as _dt
-                    # Index original messages by content prefix for fast lookup
-                    originals_index = {}
-                    for m in messages:
-                        txt = (m.get('content') or '').strip()
-                        if len(txt) >= 40:
-                            key = txt[:60]
-                            originals_index.setdefault(key, []).append(m)
-
-                    # Collect media items for messages without quotes but with metadata
-                    targets = [m for m in messages if not m.get('quoted_text') and not m.get('parent_message_id') and m.get('_media_item_id')]
-                    if targets:
-                        mids = tuple(m['_media_item_id'] for m in targets)
-                        ph = ','.join(['?']*len(mids))
-                        cursor.execute(f"SELECT Z_PK,ZMETADATA FROM ZWAMEDIAITEM WHERE Z_PK IN ({ph})", mids)
-                        meta_map = {r[0]: r[1] for r in cursor.fetchall() if r[1]}
-                        
-                        for m in targets:
-                            blob = meta_map.get(m['_media_item_id'])
-                            if not blob:
-                                continue
-                            
-                            # Parse protobuf length-delimited fields; collect text for specific tags
-                            parts = []
-                            i = 0
-                            while i < len(blob)-2:
-                                b = blob[i]
-                                wt = b & 7
-                                tagno = b >> 3
-                                if wt == 2 and i+1 < len(blob):
-                                    l = blob[i+1]
-                                    seg = blob[i+2:i+2+l]
-                                    i += 2 + l
-                                    # Tags 5,6,9,13,14 contain fragments of original quoted text
-                                    if 10 < l < 130 and tagno in (5,6,9,13,14):
-                                        try:
-                                            t = seg.decode('utf-8','ignore').strip()
-                                            if t:
-                                                parts.append(t)
-                                        except:
-                                            pass
-                                else:
-                                    i += 1
-                            
-                            if len(parts) < 2:
-                                continue
-                                
-                            # Reconstruct quoted text from fragments
-                            recon = ' '.join(parts)
-                            
-                            # Find message whose content contains fragments from reconstruction
-                            selected = None
-                            best_delta = None
-                            for key, cand_list in originals_index.items():
-                                # Check if any substantial fragment from reconstruction appears in candidate
-                                found_match = False
-                                for part in parts:
-                                    if len(part) > 15 and part in key:  # Fragment appears in candidate
-                                        found_match = True
-                                        break
-                                # Alternative: check if candidate text appears in reconstruction
-                                if not found_match and key[:25] in recon:
-                                    found_match = True
-                                
-                                if found_match:
-                                    for cand in cand_list:
-                                        # Must be different sender and earlier timestamp
-                                        if cand.get('is_from_me') == m.get('is_from_me'):
-                                            continue
-                                        if not cand.get('date') or not m.get('date'):
-                                            continue
-                                        try:
-                                            t_c = _dt.datetime.strptime(cand['date'],'%Y-%m-%d %H:%M:%S')
-                                            t_m = _dt.datetime.strptime(m['date'],'%Y-%m-%d %H:%M:%S')
-                                            if t_c >= t_m:
-                                                continue
-                                            delta = (t_m - t_c).total_seconds()
-                                            if delta > 48*3600:  # Within 48h
-                                                continue
-                                            if best_delta is None or delta < best_delta:
-                                                selected = cand
-                                                best_delta = delta
-                                        except:
-                                            continue
-                            
-                            # Assign reconstructed quote if match found
-                            if selected and not m.get('quoted_text'):
-                                snippet = selected['content'][:90]
-                                if len(selected['content']) > 90:
-                                    words = snippet.split()
-                                    if len(words) > 1:
-                                        snippet = ' '.join(words[:-1]) + '...'
-                                    else:
-                                        snippet = snippet[:85] + '...'
-                                m['quoted_text'] = snippet
-                                m['quoted_source_message_id'] = selected['message_id']
-                except Exception:
-                    pass
-
-                # Third pass: resolve forwarded hash placeholders to actual text when possible
-                import re, datetime as _dt
-                forward_hash_re = re.compile(r"^[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}$")
-                def _looks_like_forward_hash(s: str) -> bool:
-                    if not forward_hash_re.match(s):
-                        return False
-                    # Complexity requirement: must contain at least one of digit / brace / uppercase (beyond first char)
-                    has_complex = any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in s)
-                    if not has_complex:
-                        return False  # reject simple words like "aujourd'hui"
-                    return True
-                # Build list with index for quick access
-                for idx, msg in enumerate(messages):
-                    qt = msg.get('quoted_text')
-                    if isinstance(qt, ForwardInfo):
-                        # Already a ForwardInfo object; try to resolve
-                        hash_id = qt.hash_id
-                    elif isinstance(qt, str) and qt:
-                        candidate = qt.strip()
-                        if _looks_like_forward_hash(candidate):
-                            hash_id = candidate
-                            msg['quoted_text'] = ForwardInfo(hash_id)
-                        else:
-                            continue
-                    else:
-                        continue
-                    # Look backwards for candidate original message (same sender, close in time, longer content)
-                    best_candidate = None
-                    for prev in reversed(messages[max(0, idx-8):idx]):  # look back up to 8 messages
-                        if prev.get('is_from_me') != msg.get('is_from_me'):
-                            continue
-                        content = prev.get('content') or ''
-                        if len(content) < 25:
-                            continue
-                        # Time proximity
-                        try:
-                            if prev['date'] and msg['date']:
-                                # dates are strings; parse minimal
-                                # Expect format 'YYYY-MM-DD HH:MM:SS'
-                                def _parse(ts):
-                                    try:
-                                        return _dt.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
-                                    except Exception:
-                                        return None
-                                t_prev = _parse(prev['date'])
-                                t_msg = _parse(msg['date'])
-                                if t_prev and t_msg and (t_msg - t_prev).total_seconds() > 180:
-                                    continue
-                        except Exception:
-                            pass
-                        best_candidate = prev
-                        break
-                    if best_candidate:
-                        msg['forward_resolved_text'] = best_candidate['content']
-                        best_candidate['used_as_forward_source'] = True
-
-                # Fourth pass: remove spurious citations that just duplicate the immediately previous message
-                for idx, msg in enumerate(messages):
-                    qt = msg.get('quoted_text')
-                    if not qt:
-                        continue
-                    # Handle ForwardInfo duplication
-                    if isinstance(qt, ForwardInfo):
-                        if idx > 0:
-                            prev = messages[idx-1]
-                            resolved = msg.get('forward_resolved_text')
-                            prev_content = (prev.get('content') or '').strip()
-                            if resolved and prev_content and resolved.strip() == prev_content and not msg.get('parent_message_id'):
-                                same_sender = prev.get('is_from_me') == msg.get('is_from_me') and prev.get('from_jid') == msg.get('from_jid')
-                                # Time proximity
-                                def _p(ts):
-                                    try:
-                                        return _dt.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S') if ts else None
-                                    except Exception:
-                                        return None
-                                t_prev = _p(prev.get('date'))
-                                t_msg = _p(msg.get('date'))
-                                close_time = False
-                                if t_prev and t_msg:
-                                    try:
-                                        close_time = (t_msg - t_prev).total_seconds() < 6
-                                    except Exception:
-                                        pass
-                                if same_sender or close_time:
-                                    # Drop spurious forward duplicate
-                                    msg['quoted_text'] = None
-                                    msg.pop('forward_resolved_text', None)
-                                    msg.pop('forward_source_used', None)
-                        continue
-                    if idx == 0:
-                        continue
-                    prev = messages[idx-1]
-                    # Conditions for spurious duplicate:
-                    # - quoted text exactly equals previous content (after trimming)
-                    # - no parent message id (so not an explicit reply)
-                    # - previous sender same as current sender OR time delta < 5s (often fragmentation)
-                    prev_content = (prev.get('content') or '').strip()
-                    if not prev_content:
-                        continue
-                    if qt.strip() == prev_content and not msg.get('parent_message_id'):
-                        same_sender = prev.get('is_from_me') == msg.get('is_from_me') and prev.get('from_jid') == msg.get('from_jid')
-                        # Parse times
-                        def _p(ts):
-                            try:
-                                return _dt.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S') if ts else None
-                            except Exception:
-                                return None
-                        t_prev = _p(prev.get('date'))
-                        t_msg = _p(msg.get('date'))
-                        close_time = False
-                        if t_prev and t_msg:
-                            try:
-                                close_time = (t_msg - t_prev).total_seconds() < 6
-                            except Exception:
-                                pass
-                        if same_sender or close_time:
-                            # If current content begins with the quoted text (pure duplication at line wrap), drop citation
-                            content_now = (msg.get('content') or '')
-                            if content_now.startswith(prev_content):
-                                msg['quoted_text'] = None
-                            else:
-                                # Different content: still may not be a true quote; drop if very short quote (< 60) and no parent
-                                if len(prev_content) < 120:
-                                    msg['quoted_text'] = None
-                            msg.pop('forward_resolved_text', None)
-                            msg.pop('forward_source_used', None)
                 
-                return messages
+                # Parse metadata for replies
+                reply_targets = [m for m in self.messages 
+                               if not m.get('quoted_text') and not m.get('parent_message_id') and m.get('_media_item_id')]
+                self._parse_metadata_replies(cursor, reply_targets)
                 
-        except sqlite3.Error as e:
+                # Remove duplicate forwards
+                seen_forwards = set()
+                final_messages = []
+                for msg in self.messages:
+                    if msg.get('is_forwarded'):
+                        forward_key = (msg['content'], msg['date'])
+                        if forward_key in seen_forwards:
+                            continue
+                        seen_forwards.add(forward_key)
+                    final_messages.append(msg)
+                
+                return final_messages
+                
+        except Exception as e:
             print(f"❌ Database error: {e}")
             return []
     
-    def _extract_quoted_text_from_media(self, cursor, media_item_id):
-        """Extract quoted text from MediaItem metadata using SYSTEMATIC database logic.
-        
-        SYSTEMATIC LOGIC: 
-        1. Check ZMEDIAORIGIN: != 0 indicates forwarded/transferred messages
-        2. Extract Tag 1 from protobuf ZMETADATA containing citation text
-        3. No heuristic validation - trust the database structure
-        """
-        try:
-                # SYSTEMATIC CHECK: Use ZMEDIAORIGIN as reliable indicator
-                cursor.execute("SELECT ZMETADATA, ZMEDIAORIGIN FROM ZWAMEDIAITEM WHERE Z_PK = ?", (media_item_id,))
-                result = cursor.fetchone()
-                
-                if result and result[0]:
-                    metadata_blob, media_origin = result[0], result[1]
-                    # existing parsing loop...
-                    i = 0
-                    
-                    while i < len(metadata_blob) - 2:
-                        # Read protobuf field
-                        tag_byte = metadata_blob[i]
-                        if (tag_byte & 0x7) == 2:  # Length-delimited field
-                            tag = tag_byte >> 3
-                            length = metadata_blob[i + 1]
-                            
-                            if i + 2 + length <= len(metadata_blob):
-                                field_data = metadata_blob[i + 2:i + 2 + length]
-                                
-                                # SYSTEMATIC EXTRACTION: Analyser TOUS les tags
-                                if length > 2:
-                                    try:
-                                        # Direct UTF-8 decode without heuristics
-                                        quoted_text = field_data.decode('utf-8', errors='ignore')
-                                        
-                                        # Remove only trailing control characters (systematic)
-                                        import re
-                                        quoted_text = re.sub(r'[\x00-\x1f]+$', '', quoted_text).strip()
-                                        # Remove also leading control characters
-                                        quoted_text = re.sub(r'^[\x00-\x1f]+', '', quoted_text)
-
-                                        if quoted_text:
-                                            # SYSTEMATIC ACCEPTANCE: SEULEMENT Tag 1 pour les citations / forwards
-                                            if tag == 1 and len(quoted_text) > 3:
-                                                import re
-                                                # Remove control chars for forward hash pattern test
-                                                sanitized = re.sub(r"[^A-Za-z0-9'`{}]", "", quoted_text)
-                                                # Forward hash complexity: require at least one digit/brace/uppercase besides letters
-                                                if re.fullmatch(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", sanitized):
-                                                    if any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in sanitized):
-                                                        return ForwardInfo(sanitized)
-                                                # Normal human citation (keep spaces)
-                                                if len(quoted_text) > 10 and (' ' in quoted_text):
-                                                    if len(quoted_text) > 50:
-                                                        words = quoted_text[:50].split()
-                                                        if len(words) > 1:
-                                                            quoted_text = ' '.join(words[:-1]) + "..."
-                                                        else:
-                                                            quoted_text = quoted_text[:50] + "..."
-                                                    return quoted_text
-                                        
-                                    except UnicodeDecodeError:
-                                        pass
-                                
-                                i += 2 + length
-                            else:
-                                i += 1
-                        else:
-                            i += 1
-                    
-                    # When no quoted_text but metadata_blob exists, attempt forward hash detection
-                    try:
-                        import re
-                        # Scan raw bytes for ascii window that matches pattern
-                        raw_ascii = ''.join(chr(b) if 32 <= b < 127 else ' ' for b in metadata_blob)
-                        # Forward hash pattern: two alnum segments around an apostrophe/backtick, optional tail (alnum or { })
-                        candidates = re.findall(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", raw_ascii)
-                        for cand in candidates:
-                            if any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in cand):
-                                return ForwardInfo(cand)
-                    except Exception:
-                        pass
-                    return None
-            
-        except Exception as e:
-            print(f"Error extracting quoted text: {e}")
-        
-        return None
-    
-    def format_conversation_for_export(self, messages, contact_name):
-        """Format conversation messages for text export."""
+    def format_conversation(self, messages, contact_name):
+        """Format conversation for export."""
         if not messages:
-            return "No messages found in conversation."
+            return "No messages found."
         
-        # Header
         output = []
         output.append("=" * 80)
         output.append(f"WhatsApp Conversation Export")
@@ -664,15 +387,13 @@ class WhatsAppConversationExporter:
         output.append("=" * 80)
         output.append("")
         
-        # Messages
         current_date = None
         for msg in messages:
-            # If this message was only used as a forward source, still print it normally (we keep context)
             message_date = msg['date']
             if not message_date:
                 continue
                 
-            # Extract date part
+            # Date separator
             try:
                 msg_date_part = message_date.split(' ')[0]
                 if current_date != msg_date_part:
@@ -681,75 +402,52 @@ class WhatsAppConversationExporter:
             except:
                 pass
             
-            # Format time
+            # Time and sender
             try:
                 time_part = message_date.split(' ')[1]
             except:
                 time_part = "??:??"
             
-            # Build message line with prefix symbols for sender identification
-            if msg['is_from_me']:
-                # Your messages: > prefix
-                prefix = ">"
-            else:
-                # Contact messages: < prefix
-                prefix = "<"
+            prefix = ">" if msg['is_from_me'] else "<"
             
-            # Handle quoted messages with separate line formatting
+            # Handle quoted messages
             if msg.get('quoted_text'):
-                # Multi-line format for quoted messages
                 output.append(f"[{time_part}] {prefix}")
                 
-                # Citation / forward
                 citation = msg.get('quoted_text')
-                if citation:
-                    if isinstance(citation, ForwardInfo):
-                        # Prefer resolved text if available
-                        resolved = msg.get('forward_resolved_text')
-                        if resolved:
-                            lines_fw = resolved.split('\n')
-                            output.append(f"    ↳ (forwarded) {lines_fw[0]}")
-                            for extra in lines_fw[1:]:
-                                output.append(f"       {extra}")
-                        else:
-                            output.append(f"    ↳ (forwarded id {citation.hash_id})")
+                if isinstance(citation, ForwardInfo):
+                    output.append(f"    ↳ (forwarded id {citation.hash_id})")
+                else:
+                    lines = citation.split('\n')
+                    if len(lines) == 1:
+                        output.append(f"    ↳ {lines[0]}")
                     else:
-                        # Multi-line support
-                        lines = citation.split('\n')
-                        if len(lines) == 1:
-                            output.append(f"    ↳ {lines[0]}")
-                        else:
-                            output.append(f"    ↳ {lines[0]}")
-                            for extra in lines[1:]:
-                                output.append(f"       {extra}")
+                        output.append(f"    ↳ {lines[0]}")
+                        for extra in lines[1:]:
+                            output.append(f"       {extra}")
                 
                 message_line = f"    {msg['content']}"
-                # Add reaction if present
                 if msg['reaction_emoji']:
                     message_line += f" [{msg['reaction_emoji']}]"
                 output.append(message_line)
             else:
-                # Single line format for regular messages
+                # Regular message
                 content = msg['content']
                 if msg.get('is_forwarded'):
                     content = f"(forward) {content}"
                 message_line = f"[{time_part}] {prefix} {content}"
-                # Add reaction if present
                 if msg['reaction_emoji']:
                     message_line += f" [{msg['reaction_emoji']}]"
                 output.append(message_line)
         
-        # Footer stats
+        # Stats
         output.append("")
         output.append("=" * 80)
-        
-        # Count reactions
         reaction_count = sum(1 for msg in messages if msg['reaction_emoji'])
         output.append(f"📊 Total messages: {len(messages)}")
         output.append(f"🎯 Messages with reactions: {reaction_count}")
         
         if reaction_count > 0:
-            # Count by emoji type
             emoji_counts = {}
             for msg in messages:
                 if msg['reaction_emoji']:
@@ -763,23 +461,20 @@ class WhatsAppConversationExporter:
                 output.append(f"  {emoji}: {count} times ({percentage:.1f}%)")
         
         output.append("=" * 80)
-        
         return "\n".join(output)
     
     def export_conversation(self, contact_name_or_jid, output_file=None, limit=None):
-        """Export a conversation to a text file."""
+        """Export conversation to file."""
         print(f"🔍 Looking for contact: {contact_name_or_jid}")
         
-        # Create conversations directory if it doesn't exist
+        # Create directory
         conversations_dir = "conversations"
         if not os.path.exists(conversations_dir):
             os.makedirs(conversations_dir)
             print(f"📁 Created directory: {conversations_dir}")
         
-        # Get contacts with reactions
-        contacts = self.extractor.get_contacts_with_reactions()
-        
-        # Try to find contact by name or JID
+        # Find contact
+        contacts = self.get_contacts_with_reactions()
         target_contact = None
         
         for contact in contacts:
@@ -797,25 +492,23 @@ class WhatsAppConversationExporter:
         
         print(f"✅ Found contact: {target_contact['name']} ({target_contact['jid']})")
         
-        # Get conversation
-        messages = self.get_conversation_with_reactions(target_contact['jid'], limit)
-        
+        # Get messages
+        messages = self.get_conversation(target_contact['jid'], limit)
         if not messages:
             print(f"❌ No messages found for {target_contact['name']}")
             return None
         
-        # Generate output filename if not provided
+        # Generate filename
         if not output_file:
             safe_name = "".join(c for c in target_contact['name'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
             safe_name = safe_name.replace(' ', '_')
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             output_file = os.path.join(conversations_dir, f"whatsapp_conversation_{safe_name}_{timestamp}.txt")
         else:
-            # If output_file is provided, put it in conversations directory
             output_file = os.path.join(conversations_dir, os.path.basename(output_file))
         
-        # Format and export
-        formatted_text = self.format_conversation_for_export(messages, target_contact['name'])
+        # Export
+        formatted_text = self.format_conversation(messages, target_contact['name'])
         
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
@@ -823,7 +516,6 @@ class WhatsAppConversationExporter:
             
             print(f"✅ Conversation exported to: {output_file}")
             print(f"📄 File size: {os.path.getsize(output_file)} bytes")
-            
             return output_file
             
         except Exception as e:
@@ -832,22 +524,13 @@ class WhatsAppConversationExporter:
 
 
 def main():
-    """Main function - Export all conversations with reactions."""
-    print("💬 WHATSAPP CONVERSATION EXPORTER (LOCAL DATABASE)")
+    """Main function."""
+    print("💬 WHATSAPP CONVERSATION EXPORTER")
     print("=" * 60)
-    print("📝 Export ALL conversations with emoji reactions to text files")
-    print("🎯 One file per contact with complete conversation history")
+    print("📝 Export conversations with citations, forwards, and reactions")
     print()
     
-    try:
-        # Initialize exporter with local database
-        exporter = WhatsAppConversationExporter()
-        
-    except Exception as e:
-        print(f"❌ Failed to initialize exporter: {e}")
-        return
-    
-    # Parse command line arguments for optional single contact export
+    # Parse arguments
     contact_name = None
     limit = None
     
@@ -862,17 +545,18 @@ def main():
         else:
             print(f"❌ Unknown argument: {sys.argv[i]}")
             print("💡 Usage: python script.py [--contact 'Name'] [--limit 100]")
-            print("💡 If no --contact specified, exports ALL contacts")
             return
     
-    # Single contact export if specified
+    try:
+        exporter = WhatsAppExporter()
+    except Exception as e:
+        print(f"❌ Failed to initialize exporter: {e}")
+        return
+    
+    # Single contact export
     if contact_name:
         print(f"🎯 Single contact export: {contact_name}")
-        result = exporter.export_conversation(
-            contact_name_or_jid=contact_name,
-            output_file=None,
-            limit=limit
-        )
+        result = exporter.export_conversation(contact_name, None, limit)
         
         if result:
             print(f"\n🎉 Export successful!")
@@ -881,9 +565,9 @@ def main():
             print("❌ Export failed")
         return
     
-    # Export ALL contacts with reactions
-    print("🔍 Getting all contacts with reactions...")
-    contacts = exporter.extractor.get_contacts_with_reactions()
+    # Export all contacts with reactions
+    print("🔍 Getting contacts with reactions...")
+    contacts = exporter.get_contacts_with_reactions()
     
     if not contacts:
         print("❌ No contacts with reactions found.")
@@ -900,12 +584,7 @@ def main():
         print(f"\n📝 [{i}/{len(contacts)}] Exporting: {contact['name']}")
         print(f"   📊 Has {contact['reaction_count']} reaction messages")
         
-        # Export full conversation (no limit)
-        result = exporter.export_conversation(
-            contact_name_or_jid=contact['jid'],
-            output_file=None,
-            limit=limit
-        )
+        result = exporter.export_conversation(contact['jid'], None, limit)
         
         if result:
             exported_files.append({
@@ -927,7 +606,6 @@ def main():
     print(f"✅ Successfully exported: {len(exported_files)}")
     print(f"🎯 Total reaction messages: {total_reactions}")
     
-    # Calculate total size
     total_size = sum(f['size'] for f in exported_files)
     print(f"📄 Total export size: {total_size:,} bytes ({total_size/1024/1024:.1f} MB)")
     
