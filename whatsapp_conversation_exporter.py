@@ -1053,37 +1053,99 @@ def main():
     print("📝 Export conversations with citations, forwards, and reactions")
     print()
     
-    # Parse arguments
-    contact_name = None
-    limit = None
-    recent = False
-    backup_mode = False
-    backup_path = None
-    
-    i = 1
-    while i < len(sys.argv):
-        if sys.argv[i] == "--contact" and i + 1 < len(sys.argv):
-            contact_name = sys.argv[i + 1]
-            i += 2
-        elif sys.argv[i] == "--limit" and i + 1 < len(sys.argv):
-            limit = int(sys.argv[i + 1])
-            i += 2
-        elif sys.argv[i] == "--recent":
-            recent = True
-            i += 1
-        elif sys.argv[i] == "--backup":
-            backup_mode = True
-            i += 1
-        elif sys.argv[i] == "--backup-path" and i + 1 < len(sys.argv):
-            backup_path = sys.argv[i + 1]
-            backup_mode = True
-            i += 2
+    # If no arguments provided, run interactive mode
+    if len(sys.argv) == 1:
+        print("🔧 INTERACTIVE MODE")
+        print("=" * 40)
+        print("Choose data source:")
+        print("1. 📱 Local WhatsApp client data")
+        print("2. 📦 iOS backup extracted by wtsexporter")
+        print()
+        
+        while True:
+            choice = input("Enter choice (1 or 2): ").strip()
+            if choice == "1":
+                backup_mode = False
+                backup_path = None
+                print("✅ Using local WhatsApp client data")
+                break
+            elif choice == "2":
+                backup_mode = True
+                default_path = "../wtsexport"
+                print(f"📂 Default backup path: {default_path}")
+                user_path = input(f"Enter backup path (or press Enter for default): ").strip()
+                backup_path = user_path if user_path else default_path
+                print(f"✅ Using backup data from: {backup_path}")
+                break
+            else:
+                print("❌ Invalid choice. Please enter 1 or 2.")
+        
+        print()
+        print("📋 Available options for contact export:")
+        print("   • Leave empty to export all contacts")
+        print("   • Enter contact name for specific export")
+        print()
+        
+        contact_name = input("Enter contact name (or press Enter for all): ").strip()
+        if not contact_name:
+            contact_name = None
+            limit = None
+            recent = False
+            print("✅ Will export all contacts")
         else:
-            print(f"❌ Unknown argument: {sys.argv[i]}")
-            print("💡 Usage: python script.py [--contact 'Name'] [--limit 100] [--recent] [--backup] [--backup-path 'path']")
-            print("   --backup: Use wtsexporter backup instead of local WhatsApp")
-            print("   --backup-path: Path to wtsexporter output directory (default: ../working_wts)")
-            return
+            print(f"✅ Will export contact: {contact_name}")
+            
+            # Ask for additional options
+            print()
+            limit_input = input("Limit number of messages (or press Enter for all): ").strip()
+            if limit_input and limit_input.isdigit():
+                limit = int(limit_input)
+                print(f"✅ Limiting to {limit} messages")
+            else:
+                limit = None
+                
+            recent_input = input("Show recent messages first? (y/N): ").strip().lower()
+            if recent_input in ['y', 'yes']:
+                recent = True
+                print("✅ Will show recent messages first")
+            else:
+                recent = False
+        
+        print()
+        print("🚀 Starting export...")
+        print("=" * 40)
+    else:
+        # Parse command line arguments
+        contact_name = None
+        limit = None
+        recent = False
+        backup_mode = False
+        backup_path = None
+        
+        i = 1
+        while i < len(sys.argv):
+            if sys.argv[i] == "--contact" and i + 1 < len(sys.argv):
+                contact_name = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == "--limit" and i + 1 < len(sys.argv):
+                limit = int(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--recent":
+                recent = True
+                i += 1
+            elif sys.argv[i] == "--backup":
+                backup_mode = True
+                i += 1
+            elif sys.argv[i] == "--backup-path" and i + 1 < len(sys.argv):
+                backup_path = sys.argv[i + 1]
+                backup_mode = True
+                i += 2
+            else:
+                print(f"❌ Unknown argument: {sys.argv[i]}")
+                print("💡 Usage: python script.py [--contact 'Name'] [--limit 100] [--recent] [--backup] [--backup-path 'path']")
+                print("   --backup: Use wtsexporter backup instead of local WhatsApp")
+                print("   --backup-path: Path to wtsexporter output directory (default: ../working_wts)")
+                return
     
     # Display mode information
     if backup_mode:
