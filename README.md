@@ -22,7 +22,7 @@ Makes use of:
 OR
 
 **wtsexport data** (`pip install whatsapp-chat-exporter`, from https://github.com/KnugiHK/WhatsApp-Chat-Exporter)
-(example usage: `wtsexporter -i -b ~/Library/Application\ Support/MobileSync/Backup/00008110-00026C512233801E`, on a non-encrypted iOS backup)
+(example usage: `wtsexporter -i -b ~/Library/Application\ Support/MobileSync/Backup/00008110-00026C512233801E`, on a non-encrypted iOS backup, with, prior to the iOS backup, the end-to-end- encryption of whatsapp chats disabled within the Whatsapp options (Preferences -> Parameètres -> Discussions -> Sauvegarde des discussions -> Sauvegarde chiffrée de bout en bout = Non))
 
 ## Requirements
 
