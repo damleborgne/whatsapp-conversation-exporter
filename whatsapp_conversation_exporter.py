@@ -45,8 +45,41 @@ class WhatsAppExporter:
             self.media_base_path = os.path.expanduser("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Message")
             
         self.contact_cache = {}
+        self._db_connection = None
+        self._connection_lock = None
         print(f"📁 Database: {self.db_path}")
         print(f"📂 Media base: {self.media_base_path}")
+    
+    def _get_db_connection(self):
+        """Get a reusable database connection."""
+        if self._db_connection is None:
+            try:
+                # Configure SQLite for better concurrent access
+                self._db_connection = sqlite3.connect(
+                    self.db_path,
+                    timeout=30.0,  # 30 second timeout
+                    check_same_thread=False
+                )
+                # Enable WAL mode for better concurrent access
+                self._db_connection.execute("PRAGMA journal_mode=WAL")
+                self._db_connection.execute("PRAGMA synchronous=NORMAL")
+                self._db_connection.execute("PRAGMA temp_store=MEMORY")
+                self._db_connection.execute("PRAGMA mmap_size=268435456")  # 256MB
+                self._db_connection.commit()
+            except Exception as e:
+                print(f"⚠️ Failed to configure database connection: {e}")
+                # Fallback to basic connection
+                self._db_connection = sqlite3.connect(self.db_path, timeout=30.0)
+        return self._db_connection
+    
+    def _close_db_connection(self):
+        """Close the database connection."""
+        if self._db_connection:
+            try:
+                self._db_connection.close()
+            except Exception:
+                pass
+            self._db_connection = None
     
     def _find_backup_database(self):
         """Find wtsexporter database."""
@@ -84,19 +117,20 @@ class WhatsAppExporter:
             return self.contact_cache.get(jid, "Unknown")
         
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT ZPARTNERNAME FROM ZWACHATSESSION WHERE ZCONTACTJID = ?", (jid,))
-                result = cursor.fetchone()
-                
-                if result and result[0]:
-                    name = result[0]
-                else:
-                    name = f"Contact ({jid.split('@')[0]})" if '@' in jid else jid
-                
-                self.contact_cache[jid] = name
-                return name
-        except Exception:
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT ZPARTNERNAME FROM ZWACHATSESSION WHERE ZCONTACTJID = ?", (jid,))
+            result = cursor.fetchone()
+            
+            if result and result[0]:
+                name = result[0]
+            else:
+                name = f"Contact ({jid.split('@')[0]})" if '@' in jid else jid
+            
+            self.contact_cache[jid] = name
+            return name
+        except Exception as e:
+            print(f"⚠️ Error getting contact name for {jid}: {e}")
             self.contact_cache[jid] = jid
             return jid
     
@@ -230,81 +264,81 @@ class WhatsAppExporter:
     def _get_group_unique_initials(self, group_jid):
         """Generate unique initials for all members of a group."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # Get all group members with their names
-                cursor.execute("""
-                    SELECT gm.ZMEMBERJID, cs.ZPARTNERNAME
-                    FROM ZWAGROUPMEMBER gm
-                    LEFT JOIN ZWACHATSESSION cs ON gm.ZMEMBERJID = cs.ZCONTACTJID
-                    LEFT JOIN ZWACHATSESSION gs ON gs.ZCONTACTJID = ?
-                    WHERE gm.ZCHATSESSION = gs.Z_PK
-                    AND cs.ZPARTNERNAME IS NOT NULL
-                    AND cs.ZPARTNERNAME != ''
-                """, (group_jid,))
-                
-                members = cursor.fetchall()
-                
-                # Create mapping of JID to name
-                jid_to_name = {}
-                for jid, name in members:
-                    if jid and name:
-                        jid_to_name[jid] = name
-                
-                # Generate initial initials
-                name_to_initials = {}
-                initials_count = {}
-                
-                for jid, name in jid_to_name.items():
-                    basic_initials = self._get_initials(name)
-                    name_to_initials[name] = basic_initials
-                    initials_count[basic_initials] = initials_count.get(basic_initials, 0) + 1
-                
-                # Resolve conflicts by using more letters from first names
-                final_initials = {}
-                for name, initials in name_to_initials.items():
-                    if initials_count[initials] > 1:
-                        # There's a conflict, need to make unique
-                        words = name.split()
-                        if len(words) >= 2:
-                            # Use beginning of first name + initials of last names
-                            first_name = words[0]
-                            last_names = words[1:]  # All words after first name
-                            
-                            # Take first letter (uppercase) + rest lowercase from first name
-                            # Then uppercase first letter of each last name
-                            first_part = first_name[0].upper() + first_name[1:2].lower()
-                            last_part = ''.join([word[0].upper() for word in last_names])
-                            
-                            unique_initials = first_part + last_part
-                            
-                            # If still conflict, add more characters from first name
-                            counter = 3
-                            base_unique = unique_initials
-                            while unique_initials in final_initials.values():
-                                if len(first_name) > counter - 1:
-                                    first_part = first_name[0].upper() + first_name[1:counter].lower()
-                                    unique_initials = first_part + last_part
-                                    counter += 1
-                                else:
-                                    # Fallback: add numbers
-                                    unique_initials = base_unique + str(counter-2)
-                                    counter += 1
-                            
-                            final_initials[name] = unique_initials
-                        else:
-                            final_initials[name] = initials
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            
+            # Get all group members with their names
+            cursor.execute("""
+                SELECT gm.ZMEMBERJID, cs.ZPARTNERNAME
+                FROM ZWAGROUPMEMBER gm
+                LEFT JOIN ZWACHATSESSION cs ON gm.ZMEMBERJID = cs.ZCONTACTJID
+                LEFT JOIN ZWACHATSESSION gs ON gs.ZCONTACTJID = ?
+                WHERE gm.ZCHATSESSION = gs.Z_PK
+                AND cs.ZPARTNERNAME IS NOT NULL
+                AND cs.ZPARTNERNAME != ''
+            """, (group_jid,))
+            
+            members = cursor.fetchall()
+            
+            # Create mapping of JID to name
+            jid_to_name = {}
+            for jid, name in members:
+                if jid and name:
+                    jid_to_name[jid] = name
+            
+            # Generate initial initials
+            name_to_initials = {}
+            initials_count = {}
+            
+            for jid, name in jid_to_name.items():
+                basic_initials = self._get_initials(name)
+                name_to_initials[name] = basic_initials
+                initials_count[basic_initials] = initials_count.get(basic_initials, 0) + 1
+            
+            # Resolve conflicts by using more letters from first names
+            final_initials = {}
+            for name, initials in name_to_initials.items():
+                if initials_count[initials] > 1:
+                    # There's a conflict, need to make unique
+                    words = name.split()
+                    if len(words) >= 2:
+                        # Use beginning of first name + initials of last names
+                        first_name = words[0]
+                        last_names = words[1:]  # All words after first name
+                        
+                        # Take first letter (uppercase) + rest lowercase from first name
+                        # Then uppercase first letter of each last name
+                        first_part = first_name[0].upper() + first_name[1:2].lower()
+                        last_part = ''.join([word[0].upper() for word in last_names])
+                        
+                        unique_initials = first_part + last_part
+                        
+                        # If still conflict, add more characters from first name
+                        counter = 3
+                        base_unique = unique_initials
+                        while unique_initials in final_initials.values():
+                            if len(first_name) > counter - 1:
+                                first_part = first_name[0].upper() + first_name[1:counter].lower()
+                                unique_initials = first_part + last_part
+                                counter += 1
+                            else:
+                                # Fallback: add numbers
+                                unique_initials = base_unique + str(counter-2)
+                                counter += 1
+                        
+                        final_initials[name] = unique_initials
                     else:
                         final_initials[name] = initials
-                
-                # Create reverse mapping: JID to unique initials
-                jid_to_initials = {}
-                for jid, name in jid_to_name.items():
-                    jid_to_initials[jid] = final_initials.get(name, "?")
-                
-                return jid_to_initials
-                
+                else:
+                    final_initials[name] = initials
+            
+            # Create reverse mapping: JID to unique initials
+            jid_to_initials = {}
+            for jid, name in jid_to_name.items():
+                jid_to_initials[jid] = final_initials.get(name, "?")
+            
+            return jid_to_initials
+            
         except Exception as e:
             print(f"Error generating group initials: {e}")
             return {}
@@ -399,34 +433,34 @@ class WhatsAppExporter:
         # We need to find the contact JID for this contact name
         # This is a simplified approach - in real usage, you might need a more sophisticated mapping
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                # Find contact JID by name
-                cursor.execute("SELECT ZCONTACTJID FROM ZWACHATSESSION WHERE ZPARTNERNAME = ?", (contact_name,))
-                result = cursor.fetchone()
-                if result:
-                    contact_jid = result[0]
-                    # For groups, convert group JID to individual JID pattern
-                    if '@g.us' in contact_jid:
-                        # Group - use group JID as folder name
-                        jid_folder = contact_jid
-                    else:
-                        # Individual contact - use contact JID
-                        jid_folder = contact_jid
-                    
-                    # Try to find the file in the backup media structure
-                    possible_paths = [
-                        os.path.join(self.media_base_path, jid_folder, filename),
-                        os.path.join(self.media_base_path, contact_jid, filename),
-                        # If direct mapping fails, try to find it by scanning
-                    ]
-                    
-                    for path in possible_paths:
-                        if os.path.exists(path):
-                            return path
-                    
-                    # Last resort: scan the media directory for the filename
-                    return self._find_media_in_backup(filename)
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            # Find contact JID by name
+            cursor.execute("SELECT ZCONTACTJID FROM ZWACHATSESSION WHERE ZPARTNERNAME = ?", (contact_name,))
+            result = cursor.fetchone()
+            if result:
+                contact_jid = result[0]
+                # For groups, convert group JID to individual JID pattern
+                if '@g.us' in contact_jid:
+                    # Group - use group JID as folder name
+                    jid_folder = contact_jid
+                else:
+                    # Individual contact - use contact JID
+                    jid_folder = contact_jid
+                
+                # Try to find the file in the backup media structure
+                possible_paths = [
+                    os.path.join(self.media_base_path, jid_folder, filename),
+                    os.path.join(self.media_base_path, contact_jid, filename),
+                    # If direct mapping fails, try to find it by scanning
+                ]
+                
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        return path
+                
+                # Last resort: scan the media directory for the filename
+                return self._find_media_in_backup(filename)
         except Exception:
             pass
         
@@ -619,32 +653,32 @@ class WhatsAppExporter:
     def get_contacts_with_reactions(self):
         """Get contacts with reactions."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT 
-                        CASE WHEN m.ZISFROMME = 1 THEN m.ZTOJID ELSE m.ZFROMJID END as contact_jid,
-                        COUNT(*) as reaction_count
-                    FROM ZWAMESSAGE m
-                    JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
-                    WHERE m.ZMESSAGETYPE = 0 
-                    AND i.ZRECEIPTINFO IS NOT NULL
-                    AND LENGTH(i.ZRECEIPTINFO) > 50
-                    AND (HEX(i.ZRECEIPTINFO) LIKE '%F09F%' OR HEX(i.ZRECEIPTINFO) LIKE '%E2%')
-                    AND (m.ZFROMJID LIKE '%@s.whatsapp.net' OR m.ZTOJID LIKE '%@s.whatsapp.net')
-                    GROUP BY contact_jid
-                    ORDER BY reaction_count DESC
-                """)
-                
-                contacts = []
-                for jid, count in cursor.fetchall():
-                    if jid:
-                        contacts.append({
-                            'jid': jid,
-                            'name': self._get_contact_name(jid),
-                            'reaction_count': count
-                        })
-                return contacts
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    CASE WHEN m.ZISFROMME = 1 THEN m.ZTOJID ELSE m.ZFROMJID END as contact_jid,
+                    COUNT(*) as reaction_count
+                FROM ZWAMESSAGE m
+                JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
+                WHERE m.ZMESSAGETYPE = 0 
+                AND i.ZRECEIPTINFO IS NOT NULL
+                AND LENGTH(i.ZRECEIPTINFO) > 50
+                AND (HEX(i.ZRECEIPTINFO) LIKE '%F09F%' OR HEX(i.ZRECEIPTINFO) LIKE '%E2%')
+                AND (m.ZFROMJID LIKE '%@s.whatsapp.net' OR m.ZTOJID LIKE '%@s.whatsapp.net')
+                GROUP BY contact_jid
+                ORDER BY reaction_count DESC
+            """)
+            
+            contacts = []
+            for jid, count in cursor.fetchall():
+                if jid:
+                    contacts.append({
+                        'jid': jid,
+                        'name': self._get_contact_name(jid),
+                        'reaction_count': count
+                    })
+            return contacts
         except Exception as e:
             print(f"❌ Error getting contacts: {e}")
             return []
@@ -652,26 +686,26 @@ class WhatsAppExporter:
     def get_all_contacts(self):
         """Get all contacts and groups."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT ZCONTACTJID, ZPARTNERNAME
-                    FROM ZWACHATSESSION 
-                    WHERE ZCONTACTJID IS NOT NULL
-                    AND ZPARTNERNAME IS NOT NULL
-                    AND ZPARTNERNAME != ''
-                    ORDER BY ZPARTNERNAME
-                """)
-                
-                contacts = []
-                for jid, name in cursor.fetchall():
-                    if jid and name:
-                        contacts.append({
-                            'jid': jid,
-                            'name': name,
-                            'reaction_count': 0  # Default value
-                        })
-                return contacts
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT ZCONTACTJID, ZPARTNERNAME
+                FROM ZWACHATSESSION 
+                WHERE ZCONTACTJID IS NOT NULL
+                AND ZPARTNERNAME IS NOT NULL
+                AND ZPARTNERNAME != ''
+                ORDER BY ZPARTNERNAME
+            """)
+            
+            contacts = []
+            for jid, name in cursor.fetchall():
+                if jid and name:
+                    contacts.append({
+                        'jid': jid,
+                        'name': name,
+                        'reaction_count': 0  # Default value
+                    })
+            return contacts
         except Exception as e:
             print(f"❌ Error getting all contacts: {e}")
             return []
@@ -679,145 +713,145 @@ class WhatsAppExporter:
     def get_conversation(self, contact_jid, limit=None, recent=False):
         """Get conversation with all features including media."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            
+            # Check if this is a group conversation
+            is_group = contact_jid.endswith('@g.us')
+            
+            if is_group:
+                # Group conversation query with sender names and media
+                query = """
+                    SELECT 
+                        m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
+                        m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM,
+                        cs.ZPARTNERNAME, gm.ZMEMBERJID, m.ZMESSAGETYPE,
+                        mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZFILESIZE
+                    FROM ZWAMESSAGE m
+                    LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
+                    LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
+                    LEFT JOIN ZWACHATSESSION cs ON gm.ZMEMBERJID = cs.ZCONTACTJID
+                    LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+                    WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
+                    AND m.ZMESSAGETYPE IN (0, 1, 2, 3, 5, 9, 13, 14)
+                    AND (m.ZTEXT IS NOT NULL OR m.ZMEDIAITEM IS NOT NULL)
+                    ORDER BY m.ZMESSAGEDATE {}
+                """.format("DESC" if recent else "ASC")
+            else:
+                # Individual conversation query with media
+                query = """
+                    SELECT 
+                        m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
+                        m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM,
+                        NULL, NULL, m.ZMESSAGETYPE,
+                        mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZFILESIZE
+                    FROM ZWAMESSAGE m
+                    LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
+                    LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+                    WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
+                    AND m.ZMESSAGETYPE IN (0, 1, 2, 3, 5, 9, 13, 14)
+                    AND (m.ZTEXT IS NOT NULL OR m.ZMEDIAITEM IS NOT NULL)
+                    ORDER BY m.ZMESSAGEDATE {}
+                """.format("DESC" if recent else "ASC")
+            
+            if limit:
+                query += f" LIMIT {limit}"
+            
+            cursor.execute(query, (contact_jid, contact_jid))
+            rows = cursor.fetchall()
+            
+            # If recent=True, reverse the order to maintain chronological display
+            if recent:
+                rows = list(reversed(rows))
+            
+            print(f"📋 Found {len(rows)} messages...")
+            
+            # Collect all messages
+            self.messages = []
+            message_lookup = {}
+            
+            for row in rows:
+                # Decode reaction
+                reaction_emoji = None
+                if row[7]:
+                    reaction_emoji = self._decode_reaction(row[7], is_group, contact_jid if is_group else None)
                 
-                # Check if this is a group conversation
-                is_group = contact_jid.endswith('@g.us')
+                # Extract quoted text - only for messages that are actually quotes/replies
+                quoted_text = None
+                if row[8]:  # parent_message_id exists - this is definitely a reply
+                    if row[9]:  # has media_item_id, try to extract from metadata
+                        quoted_text = self._extract_quoted_text(cursor, row[9])
+                        if isinstance(quoted_text, ForwardInfo):
+                            quoted_text = None  # Don't show forward hashes as quotes
                 
-                if is_group:
-                    # Group conversation query with sender names and media
-                    query = """
-                        SELECT 
-                            m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
-                            m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM,
-                            cs.ZPARTNERNAME, gm.ZMEMBERJID, m.ZMESSAGETYPE,
-                            mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZFILESIZE
-                        FROM ZWAMESSAGE m
-                        LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
-                        LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
-                        LEFT JOIN ZWACHATSESSION cs ON gm.ZMEMBERJID = cs.ZCONTACTJID
-                        LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
-                        WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
-                        AND m.ZMESSAGETYPE IN (0, 1, 2, 3, 5, 9, 13, 14)
-                        AND (m.ZTEXT IS NOT NULL OR m.ZMEDIAITEM IS NOT NULL)
-                        ORDER BY m.ZMESSAGEDATE {}
-                    """.format("DESC" if recent else "ASC")
-                else:
-                    # Individual conversation query with media
-                    query = """
-                        SELECT 
-                            m.Z_PK, m.ZTEXT, m.ZMESSAGEDATE, m.ZFROMJID, m.ZTOJID,
-                            m.ZISFROMME, m.ZFLAGS, i.ZRECEIPTINFO, m.ZPARENTMESSAGE, m.ZMEDIAITEM,
-                            NULL, NULL, m.ZMESSAGETYPE,
-                            mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZFILESIZE
-                        FROM ZWAMESSAGE m
-                        LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
-                        LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
-                        WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
-                        AND m.ZMESSAGETYPE IN (0, 1, 2, 3, 5, 9, 13, 14)
-                        AND (m.ZTEXT IS NOT NULL OR m.ZMEDIAITEM IS NOT NULL)
-                        ORDER BY m.ZMESSAGEDATE {}
-                    """.format("DESC" if recent else "ASC")
+                flags = row[6] or 0
+                is_forwarded = bool(flags & 0x180 == 0x180)
                 
-                if limit:
-                    query += f" LIMIT {limit}"
+                # For groups, get sender name
+                sender_name = None
+                if is_group and not bool(row[5]):  # Not from me
+                    sender_name = row[10]  # ZPARTNERNAME from the join
                 
-                cursor.execute(query, (contact_jid, contact_jid))
-                rows = cursor.fetchall()
+                # Handle media
+                media_info = None
+                if row[9]:  # has media_item_id
+                    # Only create media_info if there's actual media content
+                    # (local_path exists, or file_size > 0, or title exists)
+                    if row[13] or (row[15] and row[15] > 0) or (row[14] and row[14].strip()):
+                        media_info = {
+                            'local_path': row[13],
+                            'title': row[14],
+                            'file_size': row[15],
+                            'message_type': row[12]
+                        }
                 
-                # If recent=True, reverse the order to maintain chronological display
-                if recent:
-                    rows = list(reversed(rows))
-                
-                print(f"📋 Found {len(rows)} messages...")
-                
-                # Collect all messages
-                self.messages = []
-                message_lookup = {}
-                
-                for row in rows:
-                    # Decode reaction
-                    reaction_emoji = None
-                    if row[7]:
-                        reaction_emoji = self._decode_reaction(row[7], is_group, contact_jid if is_group else None)
-                    
-                    # Extract quoted text - only for messages that are actually quotes/replies
-                    quoted_text = None
-                    if row[8]:  # parent_message_id exists - this is definitely a reply
-                        if row[9]:  # has media_item_id, try to extract from metadata
-                            quoted_text = self._extract_quoted_text(cursor, row[9])
-                            if isinstance(quoted_text, ForwardInfo):
-                                quoted_text = None  # Don't show forward hashes as quotes
-                    
-                    flags = row[6] or 0
-                    is_forwarded = bool(flags & 0x180 == 0x180)
-                    
-                    # For groups, get sender name
-                    sender_name = None
-                    if is_group and not bool(row[5]):  # Not from me
-                        sender_name = row[10]  # ZPARTNERNAME from the join
-                    
-                    # Handle media
-                    media_info = None
-                    if row[9]:  # has media_item_id
-                        # Only create media_info if there's actual media content
-                        # (local_path exists, or file_size > 0, or title exists)
-                        if row[13] or (row[15] and row[15] > 0) or (row[14] and row[14].strip()):
-                            media_info = {
-                                'local_path': row[13],
-                                'title': row[14],
-                                'file_size': row[15],
-                                'message_type': row[12]
-                            }
-                    
-                    message = {
-                        'message_id': row[0],
-                        'content': row[1],
-                        'date': self._convert_timestamp(row[2]),
-                        'from_jid': row[3],
-                        'to_jid': row[4],
-                        'is_from_me': bool(row[5]),
-                        'reaction_emoji': reaction_emoji,
-                        'parent_message_id': row[8],
-                        'quoted_text': quoted_text,
-                        'is_forwarded': is_forwarded,
-                        'sender_name': sender_name,
-                        '_media_item_id': row[9],
-                        'message_type': row[12],
-                        'media_info': media_info
-                    }
-                    self.messages.append(message)
-                    message_lookup[message['message_id']] = message
-                
-                # Resolve parent message quotes
-                for message in self.messages:
-                    if (not message['quoted_text'] and message['parent_message_id'] 
-                        and message['parent_message_id'] in message_lookup):
-                        parent_msg = message_lookup[message['parent_message_id']]
-                        quoted_content = parent_msg['content'][:50]
-                        if len(parent_msg['content']) > 50:
-                            quoted_content += "..."
-                        message['quoted_text'] = quoted_content
-                
-                # Parse metadata for replies
-                reply_targets = [m for m in self.messages 
-                               if not m.get('quoted_text') and not m.get('parent_message_id') and m.get('_media_item_id')]
-                self._parse_metadata_replies(cursor, reply_targets)
-                
-                # Remove duplicate forwards
-                seen_forwards = set()
-                final_messages = []
-                for msg in self.messages:
-                    if msg.get('is_forwarded'):
-                        forward_key = (msg['content'], msg['date'])
-                        if forward_key in seen_forwards:
-                            continue
-                        seen_forwards.add(forward_key)
-                    final_messages.append(msg)
-                
-                return final_messages
-                
+                message = {
+                    'message_id': row[0],
+                    'content': row[1],
+                    'date': self._convert_timestamp(row[2]),
+                    'from_jid': row[3],
+                    'to_jid': row[4],
+                    'is_from_me': bool(row[5]),
+                    'reaction_emoji': reaction_emoji,
+                    'parent_message_id': row[8],
+                    'quoted_text': quoted_text,
+                    'is_forwarded': is_forwarded,
+                    'sender_name': sender_name,
+                    '_media_item_id': row[9],
+                    'message_type': row[12],
+                    'media_info': media_info
+                }
+                self.messages.append(message)
+                message_lookup[message['message_id']] = message
+            
+            # Resolve parent message quotes
+            for message in self.messages:
+                if (not message['quoted_text'] and message['parent_message_id'] 
+                    and message['parent_message_id'] in message_lookup):
+                    parent_msg = message_lookup[message['parent_message_id']]
+                    quoted_content = parent_msg['content'][:50]
+                    if len(parent_msg['content']) > 50:
+                        quoted_content += "..."
+                    message['quoted_text'] = quoted_content
+            
+            # Parse metadata for replies
+            reply_targets = [m for m in self.messages 
+                           if not m.get('quoted_text') and not m.get('parent_message_id') and m.get('_media_item_id')]
+            self._parse_metadata_replies(cursor, reply_targets)
+            
+            # Remove duplicate forwards
+            seen_forwards = set()
+            final_messages = []
+            for msg in self.messages:
+                if msg.get('is_forwarded'):
+                    forward_key = (msg['content'], msg['date'])
+                    if forward_key in seen_forwards:
+                        continue
+                    seen_forwards.add(forward_key)
+                final_messages.append(msg)
+            
+            return final_messages
+            
         except Exception as e:
             print(f"❌ Database error: {e}")
             return []
@@ -1173,13 +1207,20 @@ def main():
         print(f"🎯 Single contact export: {contact_name}")
         if recent:
             print("📅 Showing recent messages first")
-        result = exporter.export_conversation(contact_name, None, limit, recent)
         
-        if result:
-            print(f"\n🎉 Export successful!")
-            print(f"📁 File: {result}")
-        else:
-            print("❌ Export failed")
+        try:
+            result = exporter.export_conversation(contact_name, None, limit, recent)
+            
+            if result:
+                print(f"\n🎉 Export successful!")
+                print(f"📁 File: {result}")
+            else:
+                print("❌ Export failed")
+        except Exception as e:
+            print(f"❌ Export failed with error: {e}")
+        finally:
+            # Clean up database connection
+            exporter._close_db_connection()
         return
     
     # Export all contacts and groups
@@ -1197,23 +1238,33 @@ def main():
     exported_files = []
     total_reactions = 0
     
-    for i, contact in enumerate(contacts, 1):
-        print(f"\n📝 [{i}/{len(contacts)}] Exporting: {contact['name']}")
-        print(f"   📊 Has {contact['reaction_count']} reaction messages")
-        
-        result = exporter.export_conversation(contact['jid'], None, limit, False)
-        
-        if result:
-            exported_files.append({
-                'contact': contact['name'],
-                'file': result,
-                'size': os.path.getsize(result),
-                'reactions': contact['reaction_count']
-            })
-            total_reactions += contact['reaction_count']
-            print(f"   ✅ Exported to: {os.path.basename(result)}")
-        else:
-            print(f"   ❌ Failed to export {contact['name']}")
+    try:
+        for i, contact in enumerate(contacts, 1):
+            print(f"\n📝 [{i}/{len(contacts)}] Exporting: {contact['name']}")
+            print(f"   📊 Has {contact['reaction_count']} reaction messages")
+            
+            try:
+                result = exporter.export_conversation(contact['jid'], None, limit, False)
+                
+                if result:
+                    exported_files.append({
+                        'contact': contact['name'],
+                        'file': result,
+                        'size': os.path.getsize(result),
+                        'reactions': contact['reaction_count']
+                    })
+                    total_reactions += contact['reaction_count']
+                    print(f"   ✅ Exported to: {os.path.basename(result)}")
+                else:
+                    print(f"   ❌ Failed to export {contact['name']}")
+            except Exception as e:
+                print(f"   ❌ Error exporting {contact['name']}: {e}")
+                # Reset connection on error to prevent database lock issues
+                exporter._close_db_connection()
+                continue
+    finally:
+        # Always clean up the database connection
+        exporter._close_db_connection()
     
     # Summary
     print("\n" + "=" * 80)
