@@ -39,9 +39,13 @@ class WhatsAppExporter:
         
         if backup_mode:
             self.db_path = db_path or self._find_backup_database()
+            if not self.db_path:
+                raise Exception("No backup database found")
             self.media_base_path = os.path.join(self.backup_base_path, "AppDomainGroup-group.net.whatsapp.WhatsApp.shared/Message/Media")
         else:
             self.db_path = db_path or self._find_database()
+            if not self.db_path:
+                raise Exception("No WhatsApp database found")
             self.media_base_path = os.path.expanduser("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Message")
             
         self.contact_cache = {}
@@ -52,6 +56,9 @@ class WhatsAppExporter:
     
     def _get_db_connection(self):
         """Get a reusable database connection."""
+        if not self.db_path:
+            raise Exception("Database path is not set")
+            
         if self._db_connection is None:
             try:
                 # Configure SQLite for better concurrent access
@@ -82,17 +89,65 @@ class WhatsAppExporter:
             self._db_connection = None
     
     def _find_backup_database(self):
-        """Find wtsexporter database."""
-        backup_db_path = os.path.join(self.backup_base_path, "7c7fba66680ef796b916b067077cc246adacf01d")
-        
+        """Find wtsexporter database by scanning for the largest 40-character filename."""
         print("🔍 Looking for wtsexporter database...")
         
-        if os.path.exists(backup_db_path):
-            print(f"✅ Found backup database: {backup_db_path}")
-            return backup_db_path
-        else:
-            print(f"⚠️ Using backup path: {backup_db_path}")
-            return backup_db_path
+        if not os.path.exists(self.backup_base_path):
+            print(f"❌ Backup directory not found: {self.backup_base_path}")
+            return None
+        
+        # Look for files with exactly 40 characters (typical iOS backup hash length)
+        candidate_files = []
+        
+        try:
+            for item in os.listdir(self.backup_base_path):
+                item_path = os.path.join(self.backup_base_path, item)
+                
+                # Check if it's a file with exactly 40 characters and no extension
+                if (os.path.isfile(item_path) and 
+                    len(item) == 40 and 
+                    '.' not in item and 
+                    all(c in '0123456789abcdefABCDEF' for c in item)):
+                    
+                    file_size = os.path.getsize(item_path)
+                    candidate_files.append((item, item_path, file_size))
+                    print(f"   📱 Found candidate: {item} ({file_size:,} bytes)")
+            
+            if not candidate_files:
+                print("❌ No 40-character database files found in backup directory")
+                # Fallback to the original hardcoded name
+                fallback_path = os.path.join(self.backup_base_path, "7c7fba66680ef796b916b067077cc246adacf01d")
+                print(f"⚠️ Using fallback path: {fallback_path}")
+                return fallback_path
+            
+            # Sort by file size (largest first) - database files are typically large
+            candidate_files.sort(key=lambda x: x[2], reverse=True)
+            
+            if len(candidate_files) == 1:
+                chosen_file = candidate_files[0]
+                print(f"✅ Using database: {chosen_file[0]} ({chosen_file[2]:,} bytes)")
+                return chosen_file[1]
+            
+            # Multiple candidates - let user choose or auto-select largest
+            print(f"\n📋 Found {len(candidate_files)} database candidates:")
+            for i, (filename, path, size) in enumerate(candidate_files[:5], 1):  # Show top 5
+                size_mb = size / (1024 * 1024)
+                print(f"   {i}. {filename} ({size_mb:.1f} MB)")
+            
+            if len(candidate_files) > 5:
+                print(f"   ... and {len(candidate_files) - 5} more")
+            
+            print(f"\n💡 Auto-selecting largest file: {candidate_files[0][0]}")
+            chosen_file = candidate_files[0]
+            print(f"✅ Using database: {chosen_file[0]} ({chosen_file[2]:,} bytes)")
+            return chosen_file[1]
+            
+        except Exception as e:
+            print(f"❌ Error scanning backup directory: {e}")
+            # Fallback to the original hardcoded name
+            fallback_path = os.path.join(self.backup_base_path, "7c7fba66680ef796b916b067077cc246adacf01d")
+            print(f"⚠️ Using fallback path: {fallback_path}")
+            return fallback_path
     
     def _find_database(self):
         """Find WhatsApp database."""
@@ -108,8 +163,10 @@ class WhatsAppExporter:
             print(f"✅ Found database: {fallback_path}")
             return fallback_path
         else:
-            print(f"⚠️ Using standard path: {standard_path}")
-            return standard_path
+            print(f"❌ Neither standard nor fallback database found")
+            print(f"   Standard path: {standard_path}")
+            print(f"   Fallback path: {fallback_path}")
+            return None
     
     def _get_contact_name(self, jid):
         """Get contact name from JID."""
@@ -894,6 +951,9 @@ class WhatsAppExporter:
             
             prefix = ">" if msg['is_from_me'] else "<"
             
+            # Add indentation for non-user messages for better readability
+            indent = "" if msg['is_from_me'] else "  "
+            
             # For group messages, add sender name
             sender_prefix = ""
             if msg.get('sender_name') and not msg['is_from_me']:
@@ -905,10 +965,10 @@ class WhatsAppExporter:
                 
                 # Format citation directly after timestamp
                 if isinstance(citation, ForwardInfo):
-                    citation_line = f"[{time_part}] ↳ (forwarded id {citation.hash_id})"
+                    citation_line = f"{indent}[{time_part}] ↳ (forwarded id {citation.hash_id})"
                 else:
                     lines = citation.split('\n')
-                    citation_line = f"[{time_part}] ↳ {lines[0]}"
+                    citation_line = f"{indent}[{time_part}] ↳ {lines[0]}"
                     
                 output.append(citation_line)
                 
@@ -918,7 +978,7 @@ class WhatsAppExporter:
                     if len(lines) > 1:
                         for extra in lines[1:]:
                             # Indent to align with the arrow
-                            output.append(f"           {extra}")
+                            output.append(f"{indent}           {extra}")
                 
                 # Handle media in quoted messages
                 if msg.get('media_info'):
@@ -931,9 +991,9 @@ class WhatsAppExporter:
                     # Use markdown link format for better VS Code support
                     if media_path:
                         filename = os.path.basename(media_path)
-                        media_line = f"           📎 {media_type}: [{filename}](./{media_path})"
+                        media_line = f"{indent}           📎 {media_type}: [{filename}](./{media_path})"
                     else:
-                        media_line = f"           📎 {media_type}: [Not downloaded]"
+                        media_line = f"{indent}           📎 {media_type}: [Not downloaded]"
                     
                     if size_kb > 0:
                         media_line += f" ({size_kb} KB)"
@@ -944,7 +1004,7 @@ class WhatsAppExporter:
                 # Add the reply message below with proper indentation and sender prefix
                 reply_content = msg['content'] or ''
                 if reply_content.strip():
-                    message_line = f"           {prefix} {sender_prefix}{reply_content}"
+                    message_line = f"{indent}           {prefix} {sender_prefix}{reply_content}"
                     if msg['reaction_emoji']:
                         message_line += f" {msg['reaction_emoji']}"
                     output.append(message_line)
@@ -962,10 +1022,10 @@ class WhatsAppExporter:
                     if media_path:
                         # Media downloaded and available
                         filename = os.path.basename(media_path)
-                        message_line = f"[{time_part}] {prefix} {sender_prefix}📎 {media_type}: [{filename}](./{media_path})"
+                        message_line = f"{indent}[{time_part}] {prefix} {sender_prefix}📎 {media_type}: [{filename}](./{media_path})"
                     else:
                         # Media not downloaded locally
-                        message_line = f"[{time_part}] {prefix} {sender_prefix}📎 {media_type}: [Not downloaded]"
+                        message_line = f"{indent}[{time_part}] {prefix} {sender_prefix}📎 {media_type}: [Not downloaded]"
                     
                     if size_kb > 0:
                         message_line += f" ({size_kb} KB)"
@@ -982,7 +1042,7 @@ class WhatsAppExporter:
                         content = f"(forward) {content}"
                     
                     if content.strip():
-                        comment_line = f"    💬 {content}"
+                        comment_line = f"{indent}    💬 {content}"
                         output.append(comment_line)
                         
                 elif msg['content'] and msg['content'].strip():
@@ -990,7 +1050,7 @@ class WhatsAppExporter:
                     content = msg['content']
                     if msg.get('is_forwarded'):
                         content = f"(forward) {content}"
-                    message_line = f"[{time_part}] {prefix} {sender_prefix}{content}"
+                    message_line = f"{indent}[{time_part}] {prefix} {sender_prefix}{content}"
                     if msg['reaction_emoji']:
                         message_line += f" {msg['reaction_emoji']}"
                     output.append(message_line)
@@ -999,7 +1059,7 @@ class WhatsAppExporter:
                     if not msg.get('media_info') and not (msg['content'] and msg['content'].strip()):
                         print(f"⚠️ Warning: Empty message found (ID: {msg.get('message_id')}, Type: {msg.get('message_type')})")
                         # Still show it with a placeholder to avoid losing data
-                        output.append(f"[{time_part}] {prefix} {sender_prefix}[Empty message - Type {msg.get('message_type', '?')}]")
+                        output.append(f"{indent}[{time_part}] {prefix} {sender_prefix}[Empty message - Type {msg.get('message_type', '?')}]")
         
         # Stats
         output.append("")
