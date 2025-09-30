@@ -28,29 +28,29 @@ class MoodAnalyzer:
             '😐': 'neutral', '😑': 'neutral', '🙄': 'skepticism'
         }
         
-        # ASCII characters for timeline - all same width for perfect alignment
-        self.mood_chars = {
-            'joy': 'J',         # 😂 -> J for Joy
-            'happiness': 'H',   # 😊 -> H for Happy
-            'love': 'L',        # ❤️ -> L for Love
-            'approval': '+',    # 👍 -> + for positive
-            'celebration': '!', # 🎉 -> ! for excitement
-            'cool': 'C',        # 😎 -> C for Cool
-            'excitement': '*',  # 🔥 -> * for intensity
-            'strength': 'S',    # 💪 -> S for Strong
-            'sadness': '-',     # 😢 -> - for negative
-            'disappointment': 'd', # 😔 -> d for disappointed
-            'anger': 'A',       # 😡 -> A for Angry
-            'shock': '!',       # 😱 -> ! for shock
-            'fear': 'F',        # 😨 -> F for Fear
-            'anxiety': 'x',     # 😰 -> x for anxious
-            'surprise': '?',    # 😮 -> ? for surprise
-            'thinking': 't',    # 🤔 -> t for thinking
-            'confusion': '?',   # 🤷 -> ? for confused
-            'neutral': '.',     # 😐 -> . for neutral
-            'skepticism': 's'   # 🙄 -> s for skeptical
+        # Add mood_emojis mapping
+        self.mood_emojis = {
+            'joy': '😂',
+            'happiness': '😊',
+            'love': '❤️',
+            'approval': '👍',
+            'celebration': '🎉',
+            'cool': '😎',
+            'excitement': '🔥',
+            'strength': '💪',
+            'sadness': '😢',
+            'disappointment': '😔',
+            'anger': '😡',
+            'shock': '😱',
+            'fear': '😨',
+            'anxiety': '😰',
+            'surprise': '😮',
+            'thinking': '🤔',
+            'confusion': '🤷',
+            'neutral': '😐',
+            'skepticism': '🙄'
         }
-    
+
     def analyze_mood_timeline(self, messages):
         """Analyze mood evolution based on reactions over time."""
         if not messages:
@@ -190,10 +190,10 @@ class MoodAnalyzer:
                     year_chars.append(mood_emoji)
                 elif week_key in weekly_activity and weekly_activity[week_key] > 0:
                     # Week has messages but no reactions - use underscore for regular width
-                    year_chars.append('_')
+                    year_chars.append('＿')
                 else:
                     # No activity this week - use space for clear separation
-                    year_chars.append(' ')
+                    year_chars.append('　')
                 
                 current_week += timedelta(weeks=1)
             
