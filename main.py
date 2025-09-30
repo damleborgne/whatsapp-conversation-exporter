@@ -156,11 +156,11 @@ def main():
             return
         
         # Multiple contacts export
-        print("🔍 Getting contacts with reactions...")
-        contacts = exporter.get_contacts_with_reactions()
+        print("🔍 Getting all contacts...")
+        contacts = exporter.get_all_contacts()
         
         if not contacts:
-            print("❌ No contacts with reactions found")
+            print("❌ No contacts found")
             return
         
         print(f"📊 Found {len(contacts)} contacts and groups")
@@ -173,7 +173,8 @@ def main():
         try:
             for i, contact in enumerate(contacts, 1):
                 print(f"\n📝 [{i}/{len(contacts)}] Exporting: {contact['name']}")
-                print(f"   📊 Has {contact['reaction_count']} reaction messages")
+                if contact['reaction_count'] > 0:
+                    print(f"   📊 Has {contact['reaction_count']} reaction messages")
                 
                 try:
                     result = exporter.export_conversation(contact['jid'], None, limit, False)

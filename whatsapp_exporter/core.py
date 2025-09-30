@@ -636,8 +636,9 @@ class WhatsAppExporter:
             if not blob:
                 continue
             
-            # Extract fragments from tags 5,6,9,13,14
+            # Enhanced extraction: analyze more tags and longer content
             parts = []
+            quoted_content = None  # For longer content in specific tags
             i = 0
             while i < len(blob) - 2:
                 b = blob[i]
@@ -647,6 +648,7 @@ class WhatsAppExporter:
                     data = blob[i + 2:i + 2 + length]
                     i += 2 + length
                     
+                    # Original algorithm: tags 5,6,9,13,14 with length 10-130
                     if 10 < length < 130 and tag in (5, 6, 9, 13, 14):
                         try:
                             text = data.decode('utf-8', 'ignore').strip()
@@ -654,11 +656,44 @@ class WhatsAppExporter:
                                 parts.append(text)
                         except:
                             pass
+                    # Enhanced: check tag 1 for longer quoted content (like "bons élèves" case)
+                    elif tag == 1 and 50 < length < 500:  # Reasonable range for quoted messages
+                        try:
+                            text = data.decode('utf-8', 'ignore').strip()
+                            # Look for quoted message patterns
+                            if (text and len(text) > 20 and 
+                                any(word in text.lower() for word in ['que', 'je', 'tu', 'il', 'elle', 'on', 'nous', 'vous', 'ils'])):
+                                quoted_content = text[:200]  # Take first 200 chars
+                        except:
+                            pass
+                    # Enhanced: check tags 1-4 for other potential content
+                    elif tag in (2, 3, 4) and 15 < length < 200:
+                        try:
+                            text = data.decode('utf-8', 'ignore').strip()
+                            if text and len(text) > 15:
+                                parts.append(text)
+                        except:
+                            pass
                 else:
                     i += 1
             
-            if len(parts) < 2:
-                continue
+            # Enhanced matching logic
+            if len(parts) >= 2 or quoted_content:
+                # Use quoted_content if we have it and parts are insufficient
+                if quoted_content and len(parts) < 2:
+                    # Direct matching with quoted_content
+                    best_match = self._find_matching_message_by_content(quoted_content, msg)
+                    if best_match:
+                        content = best_match['content']
+                        if len(content) > 90:
+                            words = content[:90].split()
+                            content = ' '.join(words[:-1]) + '...' if len(words) > 1 else content[:85] + '...'
+                        msg['quoted_text'] = content
+                        continue
+                
+                # Original algorithm continues here if we have enough parts
+                if len(parts) < 2:
+                    continue
             
             # Find matching original
             reconstruction = ' '.join(parts)
@@ -700,6 +735,63 @@ class WhatsAppExporter:
                     words = content[:90].split()
                     content = ' '.join(words[:-1]) + '...' if len(words) > 1 else content[:85] + '...'
                 msg['quoted_text'] = content
+    
+    def _find_matching_message_by_content(self, quoted_content, reply_msg):
+        """Find a message that matches quoted content directly."""
+        # Clean quoted content for matching
+        clean_quoted = quoted_content.lower().strip()
+        
+        for candidate in self.messages:
+            if not candidate.get('content'):
+                continue
+                
+            # Skip if same author (can't quote yourself in this context)
+            if candidate.get('is_from_me') == reply_msg.get('is_from_me'):
+                continue
+                
+            # Check temporal ordering and proximity
+            if not candidate.get('date') or not reply_msg.get('date'):
+                continue
+                
+            try:
+                from datetime import datetime
+                t1 = datetime.strptime(candidate['date'], '%Y-%m-%d %H:%M:%S')
+                t2 = datetime.strptime(reply_msg['date'], '%Y-%m-%d %H:%M:%S')
+                
+                # Candidate must be before reply
+                if t1 >= t2:
+                    continue
+                    
+                # Must be within reasonable time window (48 hours)
+                delta = (t2 - t1).total_seconds()
+                if delta > 48 * 3600:
+                    continue
+                    
+                # Check content similarity
+                candidate_content = candidate['content'].lower().strip()
+                
+                # Direct substring match (quoted content should be subset of original)
+                if clean_quoted[:50] in candidate_content:
+                    return candidate
+                    
+                # Fuzzy matching: check if significant words overlap
+                quoted_words = set(clean_quoted.split())
+                candidate_words = set(candidate_content.split())
+                
+                # Remove common words
+                common_words = {'le', 'la', 'les', 'de', 'du', 'des', 'un', 'une', 'et', 'ou', 'que', 'qui', 'je', 'tu', 'il', 'elle', 'on', 'nous', 'vous', 'ils', 'elles', 'ce', 'ca', 'ça'}
+                quoted_words -= common_words
+                candidate_words -= common_words
+                
+                if len(quoted_words) > 3 and len(candidate_words) > 3:
+                    overlap = len(quoted_words.intersection(candidate_words))
+                    if overlap >= min(3, len(quoted_words) * 0.6):
+                        return candidate
+                        
+            except Exception:
+                continue
+                
+        return None
     
     def _generate_filename(self, contact_name):
         """Generate safe filename for export."""

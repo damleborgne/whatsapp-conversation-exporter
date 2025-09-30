@@ -45,7 +45,7 @@ class ConversationFormatter:
             output.append("-" * 40)
             for timeline_line in mood_analysis['weekly_timeline']:
                 output.append(timeline_line)
-            output.append("Legend: 💬=messages, ·=no activity, emoji=dominant mood")
+            output.append("Legend: _=messages, (space)=no activity, emoji=dominant mood")
             if mood_analysis['total_reactions'] > 0:
                 output.append(f"Total reactions: {mood_analysis['total_reactions']}")
         
@@ -114,8 +114,8 @@ class ConversationFormatter:
             
             prefix = ">" if msg['is_from_me'] else "<"
             
-            # Add indentation for non-user messages for better readability
-            indent = "" if msg['is_from_me'] else "  "
+            # Remove indentation for better readability - all messages aligned to left
+            indent = ""
             
             # For group messages, add sender name
             sender_prefix = ""
