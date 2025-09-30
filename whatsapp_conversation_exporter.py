@@ -17,7 +17,7 @@ import sqlite3
 import os
 import sys
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 class ForwardInfo:
@@ -180,7 +180,7 @@ class WhatsAppExporter:
             result = cursor.fetchone()
             
             if result and result[0]:
-                name = result[0]
+                name = self._clean_contact_name(result[0])
             else:
                 name = f"Contact ({jid.split('@')[0]})" if '@' in jid else jid
             
@@ -306,7 +306,297 @@ class WhatsAppExporter:
         except Exception:
             return emoji
     
+    def _extract_phone_number(self, jid):
+        """Extract phone number from JID."""
+        if not jid:
+            return None
+        
+        # For individual contacts: "33123456789@s.whatsapp.net"
+        # For groups: "33123456789-1234567890@g.us"
+        if '@s.whatsapp.net' in jid:
+            return jid.split('@')[0]
+        elif '@g.us' in jid:
+            # For groups, extract the creator's number (before the dash)
+            group_part = jid.split('@')[0]
+            if '-' in group_part:
+                return group_part.split('-')[0]
+        
+        return None
+
+    def _clean_contact_name(self, name):
+        """Clean contact name by removing invisible Unicode characters."""
+        if not name:
+            return name
+        
+        # Remove common invisible Unicode characters
+        invisible_chars = [
+            '\u200E',  # Left-to-Right Mark (LTR)
+            '\u200F',  # Right-to-Left Mark (RTL)
+            '\u202A',  # Left-to-Right Embedding
+            '\u202B',  # Right-to-Left Embedding
+            '\u202C',  # Pop Directional Formatting
+            '\u202D',  # Left-to-Right Override
+            '\u202E',  # Right-to-Left Override
+            '\u2066',  # Left-to-Right Isolate
+            '\u2067',  # Right-to-Left Isolate
+            '\u2068',  # First Strong Isolate
+            '\u2069',  # Pop Directional Isolate
+            '\uFEFF',  # Zero Width No-Break Space (BOM)
+            '\u200B',  # Zero Width Space
+            '\u200C',  # Zero Width Non-Joiner
+            '\u200D',  # Zero Width Joiner
+        ]
+        
+        cleaned_name = name
+        for char in invisible_chars:
+            cleaned_name = cleaned_name.replace(char, '')
+        
+        # Remove leading/trailing whitespace
+        cleaned_name = cleaned_name.strip()
+        
+        return cleaned_name if cleaned_name else name
+
+    def _format_phone_number(self, phone):
+        """Format phone number for better readability."""
+        if not phone or not phone.isdigit():
+            return phone
+        
+        # French numbers (starting with 33)
+        if phone.startswith('33') and len(phone) >= 11:
+            # Format: +33 X XX XX XX XX
+            formatted = f"+33 {phone[2]}"
+            for i in range(3, len(phone), 2):
+                if i + 1 < len(phone):
+                    formatted += f" {phone[i:i+2]}"
+                else:
+                    formatted += f" {phone[i:]}"
+            return formatted
+        
+        # US numbers (starting with 1)
+        elif phone.startswith('1') and len(phone) == 11:
+            # Format: +1 (XXX) XXX-XXXX
+            return f"+1 ({phone[1:4]}) {phone[4:7]}-{phone[7:]}"
+        
+        # Other international numbers
+        elif len(phone) > 7:
+            return f"+{phone}"
+        
+        return phone
+
+    def _analyze_mood_timeline(self, messages):
+        """Analyze mood evolution based on reactions over time."""
+        if not messages:
+            return None
+        
+        # Define mood categories for different emoji reactions
+        mood_categories = {
+            # Positive emotions
+            '😂': 'joy', '🤣': 'joy', '😄': 'joy', '😆': 'joy', '😁': 'joy',
+            '😊': 'happiness', '😍': 'love', '🥰': 'love', '😘': 'love', '💕': 'love', '❤️': 'love',
+            '👍': 'approval', '👏': 'approval', '🙌': 'celebration', '🎉': 'celebration',
+            '😎': 'cool', '🔥': 'excitement', '💪': 'strength',
+            
+            # Negative emotions
+            '😢': 'sadness', '😭': 'sadness', '😞': 'sadness', '😔': 'disappointment',
+            '😠': 'anger', '😡': 'anger', '🤬': 'anger',
+            '😱': 'shock', '😨': 'fear', '😰': 'anxiety',
+            
+            # Neutral/Mixed emotions
+            '😮': 'surprise', '😯': 'surprise', '🤔': 'thinking', '🤷': 'confusion',
+            '😐': 'neutral', '😑': 'neutral', '🙄': 'skepticism'
+        }
+        
+        # Extract reactions with timestamps
+        reactions_timeline = []
+        
+        for msg in messages:
+            if msg.get('reaction_emoji') and msg.get('date'):
+                try:
+                    # Parse the reaction emoji(s)
+                    reaction_text = msg['reaction_emoji']
+                    
+                    # Handle group reactions format [AB:😂;CD:😍]
+                    if reaction_text.startswith('[') and reaction_text.endswith(']'):
+                        # Group reactions
+                        reaction_content = reaction_text[1:-1]  # Remove brackets
+                        individual_reactions = reaction_content.split(';')
+                        
+                        for reaction_item in individual_reactions:
+                            if ':' in reaction_item:
+                                person, emoji = reaction_item.split(':', 1)
+                                mood = mood_categories.get(emoji, 'unknown')
+                                if mood != 'unknown':
+                                    reactions_timeline.append({
+                                        'date': msg['date'],
+                                        'emoji': emoji,
+                                        'mood': mood,
+                                        'person': person.strip(),
+                                        'is_group': True
+                                    })
+                    else:
+                        # Individual reaction
+                        emoji = reaction_text.strip()
+                        mood = mood_categories.get(emoji, 'unknown')
+                        if mood != 'unknown':
+                            reactions_timeline.append({
+                                'date': msg['date'],
+                                'emoji': emoji,
+                                'mood': mood,
+                                'person': 'Contact' if not msg.get('is_from_me') else 'Moi',
+                                'is_group': False
+                            })
+                except Exception:
+                    continue
+        
+        if not reactions_timeline:
+            return None
+        
+        # Sort by date
+        reactions_timeline.sort(key=lambda x: x['date'])
+        
+        # Create weekly timeline
+        weekly_timeline = self._create_weekly_timeline(messages, reactions_timeline)
+        
+        return {
+            'weekly_timeline': weekly_timeline,
+            'total_reactions': len(reactions_timeline),
+            'start_date': reactions_timeline[0]['date'] if reactions_timeline else None,
+            'end_date': reactions_timeline[-1]['date'] if reactions_timeline else None
+        }
+
+    def _create_weekly_timeline(self, messages, reactions_timeline):
+        """Create a compact weekly timeline with one character per week, organized by year."""
+        if not messages:
+            return []
+        
+        try:
+            # Get conversation date range
+            start_date = datetime.strptime(messages[0]['date'], '%Y-%m-%d %H:%M:%S')
+            end_date = datetime.strptime(messages[-1]['date'], '%Y-%m-%d %H:%M:%S')
+            
+            # Find the Monday of the first week and the Sunday of the last week
+            start_monday = start_date - timedelta(days=start_date.weekday())
+            end_sunday = end_date + timedelta(days=(6 - end_date.weekday()))
+            
+            # Create weekly buckets
+            weekly_moods = {}
+            weekly_activity = {}
+            
+            # First, mark weeks with any conversation activity
+            for msg in messages:
+                try:
+                    msg_date = datetime.strptime(msg['date'], '%Y-%m-%d %H:%M:%S')
+                    week_start = msg_date - timedelta(days=msg_date.weekday())
+                    week_key = week_start.strftime('%Y-%m-%d')
+                    
+                    if week_key not in weekly_activity:
+                        weekly_activity[week_key] = 0
+                    weekly_activity[week_key] += 1
+                except Exception:
+                    continue
+            
+            # Then, analyze mood for weeks with reactions
+            for reaction in reactions_timeline:
+                try:
+                    reaction_date = datetime.strptime(reaction['date'], '%Y-%m-%d %H:%M:%S')
+                    week_start = reaction_date - timedelta(days=reaction_date.weekday())
+                    week_key = week_start.strftime('%Y-%m-%d')
+                    
+                    if week_key not in weekly_moods:
+                        weekly_moods[week_key] = {}
+                    
+                    mood = reaction['mood']
+                    if mood not in weekly_moods[week_key]:
+                        weekly_moods[week_key][mood] = 0
+                    weekly_moods[week_key][mood] += 1
+                except Exception:
+                    continue
+            
+            # Build timeline string by year
+            timeline_lines = []
+            current_week = start_monday
+            current_year = None
+            year_chars = []
+            
+            while current_week <= end_sunday:
+                week_year = current_week.year
+                week_key = current_week.strftime('%Y-%m-%d')
+                
+                # If we've moved to a new year, save the previous year's line
+                if current_year is not None and week_year != current_year:
+                    if year_chars:
+                        timeline_str = ''.join(year_chars)
+                        start_of_year = datetime(current_year, 1, 1)
+                        end_of_year = datetime(current_year, 12, 31)
+                        start_marker = start_of_year.strftime('%Y')
+                        timeline_lines.append(f"{start_marker}: {timeline_str}")
+                    year_chars = []
+                
+                current_year = week_year
+                
+                # Determine character for this week
+                if week_key in weekly_moods and weekly_moods[week_key]:
+                    # Week has reactions - find dominant mood
+                    dominant_mood = max(weekly_moods[week_key].items(), key=lambda x: x[1])[0]
+                    mood_emoji = self._get_mood_emoji(dominant_mood)
+                    year_chars.append(mood_emoji)
+                elif week_key in weekly_activity and weekly_activity[week_key] > 0:
+                    # Week has messages but no reactions - use neutral indicator
+                    year_chars.append('💬')
+                else:
+                    # No activity this week
+                    year_chars.append('·')
+                
+                current_week += timedelta(weeks=1)
+            
+            # Add the last year
+            if year_chars and current_year:
+                timeline_str = ''.join(year_chars)
+                start_marker = str(current_year)
+                timeline_lines.append(f"{start_marker}: {timeline_str}")
+            
+            return timeline_lines
+            
+        except Exception as e:
+            print(f"⚠️ Error creating weekly timeline: {e}")
+            return []
+
+    def _get_mood_emoji(self, mood):
+        """Get representative emoji for a mood category."""
+        mood_emojis = {
+            'joy': '😂',
+            'happiness': '😊',
+            'love': '❤️',
+            'approval': '👍',
+            'celebration': '🎉',
+            'cool': '😎',
+            'excitement': '🔥',
+            'strength': '💪',
+            'sadness': '😢',
+            'disappointment': '😔',
+            'anger': '😡',
+            'shock': '😱',
+            'fear': '😨',
+            'anxiety': '😰',
+            'surprise': '😮',
+            'thinking': '🤔',
+            'confusion': '🤷',
+            'neutral': '😐',
+            'skepticism': '🙄'
+        }
+        return mood_emojis.get(mood, '📝')
+
     def _get_initials(self, name):
+        """Generate initials from a name."""
+        if not name:
+            return "?"
+        
+        # Split name and take first letter of each word
+        words = name.split()
+        initials = ''.join([word[0].upper() for word in words if word])
+        
+        # Limit to 3 characters max
+        return initials[:3] if initials else "?"
         """Generate initials from a name."""
         if not name:
             return "?"
@@ -411,6 +701,93 @@ class WhatsAppExporter:
             self._group_initials_cache[cache_key] = self._get_group_unique_initials(group_jid)
         
         return self._group_initials_cache[cache_key].get(member_jid, "?")
+
+    def _get_conversation_participants(self, contact_jid):
+        """Get all participants in a conversation with their names and phone numbers."""
+        participants = []
+        is_group = contact_jid.endswith('@g.us')
+        my_phone_number = None  # To store your own phone number
+        
+        try:
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            
+            if is_group:
+                # For groups, get all members
+                cursor.execute("""
+                    SELECT gm.ZMEMBERJID, cs.ZPARTNERNAME
+                    FROM ZWAGROUPMEMBER gm
+                    LEFT JOIN ZWACHATSESSION cs ON gm.ZMEMBERJID = cs.ZCONTACTJID
+                    LEFT JOIN ZWACHATSESSION gs ON gs.ZCONTACTJID = ?
+                    WHERE gm.ZCHATSESSION = gs.Z_PK
+                    ORDER BY cs.ZPARTNERNAME
+                """, (contact_jid,))
+                
+                members = cursor.fetchall()
+                
+                for member_jid, member_name in members:
+                    if member_jid:
+                        phone = self._extract_phone_number(member_jid)
+                        formatted_phone = self._format_phone_number(phone) if phone else "Numéro inconnu"
+                        
+                        # Check if this is "you" (your own contact)
+                        cleaned_name = self._clean_contact_name(member_name) if member_name and member_name.strip() else None
+                        
+                        if cleaned_name and cleaned_name.lower() in ['vous', 'you']:
+                            # This is your own contact - store the phone number for later
+                            my_phone_number = formatted_phone
+                            continue  # Skip adding this to participants list
+                        
+                        # Use provided name or fallback to phone/formatted phone
+                        if cleaned_name:
+                            display_name = cleaned_name
+                        elif formatted_phone != "Numéro inconnu":
+                            display_name = "Inconnu"
+                        else:
+                            display_name = "Inconnu"
+                        
+                        participants.append({
+                            'jid': member_jid,
+                            'name': display_name,
+                            'phone': phone,
+                            'formatted_phone': formatted_phone
+                        })
+                
+                # Add "me" to the group participants with the detected phone number
+                participants.append({
+                    'jid': 'me',
+                    'name': 'Moi',
+                    'phone': None,
+                    'formatted_phone': my_phone_number if my_phone_number else 'Mon numéro'
+                })
+                
+            else:
+                # For individual conversations, get both participants
+                # Get the contact
+                contact_name = self._get_contact_name(contact_jid)
+                phone = self._extract_phone_number(contact_jid)
+                formatted_phone = self._format_phone_number(phone) if phone else "Inconnu"
+                
+                participants.append({
+                    'jid': contact_jid,
+                    'name': contact_name if contact_name != contact_jid else "Inconnu",
+                    'phone': phone,
+                    'formatted_phone': formatted_phone
+                })
+                
+                # Add "me"
+                participants.append({
+                    'jid': 'me',
+                    'name': 'Moi',
+                    'phone': None,
+                    'formatted_phone': 'Moi'
+                })
+            
+            return participants
+            
+        except Exception as e:
+            print(f"⚠️ Error getting conversation participants: {e}")
+            return []
     
     def _get_media_type_name(self, message_type):
         """Get human-readable media type name."""
@@ -913,7 +1290,7 @@ class WhatsAppExporter:
             print(f"❌ Database error: {e}")
             return []
     
-    def format_conversation(self, messages, contact_name):
+    def format_conversation(self, messages, contact_name, contact_jid=None):
         """Format conversation for export."""
         if not messages:
             return "No messages found."
@@ -925,6 +1302,46 @@ class WhatsAppExporter:
         output.append(f"Messages: {len(messages)}")
         output.append(f"Date Range: {messages[0]['date']} to {messages[-1]['date']}")
         output.append(f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Add mood timeline analysis
+        mood_analysis = self._analyze_mood_timeline(messages)
+        if mood_analysis and mood_analysis.get('weekly_timeline'):
+            output.append("")
+            output.append("MOOD TIMELINE:")
+            output.append("-" * 40)
+            for timeline_line in mood_analysis['weekly_timeline']:
+                output.append(timeline_line)
+            output.append("Legend: 💬=messages, ·=no activity, emoji=dominant mood")
+            if mood_analysis['total_reactions'] > 0:
+                output.append(f"Total reactions: {mood_analysis['total_reactions']}")
+        
+        # Add participants list if we have the contact_jid
+        if contact_jid:
+            participants = self._get_conversation_participants(contact_jid)
+            if participants:
+                output.append("")
+                output.append("PARTICIPANTS:")
+                output.append("-" * 40)
+                
+                # Sort participants: "Moi" first, then alphabetically by name
+                participants_sorted = sorted(participants, key=lambda p: (p['name'] != 'Moi', p['name'].lower()))
+                
+                for participant in participants_sorted:
+                    if participant['name'] == 'Moi':
+                        # Show "Moi" with phone number if available
+                        if participant['formatted_phone'] and participant['formatted_phone'] not in ['Moi', 'Mon numéro']:
+                            output.append(f"• {participant['name']} ({participant['formatted_phone']})")
+                        else:
+                            output.append(f"• {participant['name']}")
+                    else:
+                        # For unknown names, show the phone number as the main identifier
+                        if participant['name'] == "Inconnu" and participant['formatted_phone'] != "Numéro inconnu":
+                            output.append(f"• {participant['formatted_phone']}")
+                        else:
+                            # Show name with phone number
+                            phone_display = participant['formatted_phone'] if participant['formatted_phone'] != "Numéro inconnu" else "Numéro inconnu"
+                            output.append(f"• {participant['name']} ({phone_display})")
+        
         output.append("=" * 80)
         output.append("")
         
@@ -1064,24 +1481,8 @@ class WhatsAppExporter:
         # Stats
         output.append("")
         output.append("=" * 80)
-        reaction_count = sum(1 for msg in messages if msg['reaction_emoji'])
-        output.append(f"📊 Total messages: {len(messages)}")
-        output.append(f"🎯 Messages with reactions: {reaction_count}")
-        
-        if reaction_count > 0:
-            emoji_counts = {}
-            for msg in messages:
-                if msg['reaction_emoji']:
-                    emoji = msg['reaction_emoji']
-                    emoji_counts[emoji] = emoji_counts.get(emoji, 0) + 1
-            
-            output.append(f"😊 Unique emoji types: {len(emoji_counts)}")
-            output.append("\nReaction breakdown:")
-            for emoji, count in sorted(emoji_counts.items(), key=lambda x: x[1], reverse=True):
-                percentage = (count / reaction_count) * 100
-                output.append(f"  {emoji}: {count} times ({percentage:.1f}%)")
-        
-        output.append("=" * 80)
+        #output.append(f"📊 Total messages: {len(messages)}")
+        #output.append("=" * 80)
         return "\n".join(output)
     
     def export_conversation(self, contact_name_or_jid, output_file=None, limit=None, recent=False):
@@ -1132,7 +1533,7 @@ class WhatsAppExporter:
             output_file = os.path.join(conversations_dir, os.path.basename(output_file))
         
         # Export
-        formatted_text = self.format_conversation(messages, target_contact['name'])
+        formatted_text = self.format_conversation(messages, target_contact['name'], target_contact['jid'])
         
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
