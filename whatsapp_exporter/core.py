@@ -21,13 +21,20 @@ class WhatsAppExporter:
         self.db_manager = DatabaseManager(db_path, backup_mode, backup_base_path)
         self.participant_manager = ParticipantManager(self.db_manager)
         self.mood_analyzer = MoodAnalyzer()
-        self.formatter = ConversationFormatter(self.participant_manager, self.mood_analyzer)
+        
+        # Media handling setup
+        self.media_base_path = self._get_media_base_path(backup_mode, backup_base_path)
+        
+        self.formatter = ConversationFormatter(
+            self.participant_manager, 
+            self.mood_analyzer,
+            self.media_base_path,
+            backup_mode,
+            self.db_manager
+        )
         
         # Message processing
         self.messages = []
-        
-        # Media handling
-        self.media_base_path = self._get_media_base_path(backup_mode, backup_base_path)
         
         print(f"📁 Database: {self.db_manager.db_path}")
         if self.media_base_path:
@@ -36,6 +43,27 @@ class WhatsAppExporter:
     def _get_media_base_path(self, backup_mode, backup_base_path):
         """Get media base path for file attachments."""
         if backup_mode and backup_base_path:
+            # Try different possible locations for media files in wtsexporter backups
+            possible_media_paths = [
+                # Direct path  
+                backup_base_path,
+                # In AppDomainGroup folder (wtsexporter structure)
+                os.path.join(backup_base_path, "AppDomainGroup-group.net.whatsapp.WhatsApp.shared"),
+                # In result folder (alternative wtsexporter structure)
+                os.path.join(backup_base_path, "result", "AppDomainGroup-group.net.whatsapp.WhatsApp.shared"),
+            ]
+            
+            # Return the first path that exists and contains a Message directory
+            for media_path in possible_media_paths:
+                message_path = os.path.join(media_path, "Message")
+                if os.path.exists(message_path):
+                    return message_path
+            
+            # If no Message directory found, return the first existing path
+            for media_path in possible_media_paths:
+                if os.path.exists(media_path):
+                    return media_path
+                    
             return backup_base_path
         else:
             return os.path.expanduser("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Message")
@@ -169,7 +197,23 @@ class WhatsAppExporter:
         """, (f"%{contact_input}%",))
         
         if contacts:
-            jid, name = contacts[0]
+            # If multiple matches, prefer the one with more messages (likely more recent/active)
+            if len(contacts) > 1:
+                print(f"🔍 Found {len(contacts)} contacts matching '{contact_input}':")
+                for i, (jid, name) in enumerate(contacts):
+                    msg_count = self.db_manager.fetch_one(
+                        "SELECT COUNT(*) FROM ZWAMESSAGE WHERE ZFROMJID = ? OR ZTOJID = ?", 
+                        (jid, jid))[0]
+                    print(f"   {i+1}. {name} ({msg_count} messages)")
+                
+                # Pick the one with most messages
+                best_contact = max(contacts, key=lambda c: self.db_manager.fetch_one(
+                    "SELECT COUNT(*) FROM ZWAMESSAGE WHERE ZFROMJID = ? OR ZTOJID = ?", 
+                    (c[0], c[0]))[0])
+                jid, name = best_contact
+                print(f"💡 Auto-selected: {name}")
+            else:
+                jid, name = contacts[0]
             return {'jid': jid, 'name': name}
         
         print(f"❌ Contact '{contact_input}' not found.")
@@ -180,11 +224,11 @@ class WhatsAppExporter:
         self.messages = []
         
         try:
-            # Base query for messages
+            # Base query for messages - matches the working original code
             query = """
                 SELECT 
                     m.Z_PK as message_id,
-                    datetime(m.ZMESSAGEDATE + 978307200, 'unixepoch') as date,
+                    m.ZMESSAGEDATE as message_date,
                     m.ZTEXT as content,
                     m.ZISFROMME as is_from_me,
                     m.ZMESSAGETYPE as message_type,
@@ -192,9 +236,19 @@ class WhatsAppExporter:
                     m.ZFROMJID as from_jid,
                     m.ZTOJID as to_jid,
                     m.ZCHATSESSION as chat_session,
-                    m.ZPARENTMESSAGE as parent_message_id
+                    m.ZPARENTMESSAGE as parent_message_id,
+                    m.ZFLAGS as flags,
+                    i.ZRECEIPTINFO as receipt_info,
+                    m.ZMEDIAITEM as media_item_id,
+                    mi.ZMEDIALOCALPATH as media_local_path,
+                    mi.ZTITLE as media_title,
+                    mi.ZFILESIZE as media_file_size
                 FROM ZWAMESSAGE m
+                LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
+                LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
                 WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
+                AND m.ZMESSAGETYPE IN (0, 1, 2, 3, 5, 9, 13, 14)
+                AND (m.ZTEXT IS NOT NULL OR m.ZMEDIAITEM IS NOT NULL)
                 ORDER BY m.ZMESSAGEDATE {}
             """.format("DESC" if recent else "ASC")
             
@@ -223,10 +277,10 @@ class WhatsAppExporter:
     
     def _process_message_row(self, row, contact_jid):
         """Process a single message row."""
-        # Convert row to dict
+        # Convert row to dict - now handles all fields from the query including media
         message = {
             'message_id': row[0],
-            'date': row[1],
+            'date': self._convert_timestamp(row[1]),  # Convert timestamp in Python like original
             'content': row[2] or '',
             'is_from_me': bool(row[3]),
             'message_type': row[4],
@@ -235,12 +289,34 @@ class WhatsAppExporter:
             'to_jid': row[7],
             'chat_session': row[8],
             'parent_message_id': row[9],
+            'flags': row[10] or 0,
+            'receipt_info': row[11],
+            'media_item_id': row[12],
+            'media_local_path': row[13],
+            'media_title': row[14],
+            'media_file_size': row[15],
             'sender_name': None,
             'quoted_text': None,
             'reaction_emoji': None,
             'media_info': None,
             'is_forwarded': False
         }
+        
+        # Handle forwarded messages
+        message['is_forwarded'] = bool(message['flags'] & 0x180 == 0x180)
+        
+        # Handle media info
+        if message['media_item_id']:
+            # Only create media_info if there's actual media content
+            if (message['media_local_path'] or 
+                (message['media_file_size'] and message['media_file_size'] > 0) or 
+                (message['media_title'] and message['media_title'].strip())):
+                message['media_info'] = {
+                    'local_path': message['media_local_path'],
+                    'title': message['media_title'],
+                    'file_size': message['media_file_size'],
+                    'message_type': message['message_type']
+                }
         
         # Get sender name for group messages
         if contact_jid.endswith('@g.us') and message['group_member_id']:
@@ -249,6 +325,23 @@ class WhatsAppExporter:
         # Get reaction info
         self._get_message_reactions(message)
         
+        # Extract quoted text - only for messages that are actually quotes/replies (matches original logic)
+        if message['parent_message_id']:
+            # First try the complex metadata extraction
+            quoted_text = None
+            if message['media_item_id']:  # has media_item_id, try to extract from metadata
+                quoted_text = self._extract_quoted_text(message['media_item_id'])
+            
+            # If metadata extraction failed, fallback to parent message text
+            if not quoted_text:
+                parent_text = self._get_parent_message_text(message['parent_message_id'])
+                if parent_text:
+                    # Take first 50 characters of parent message
+                    quoted_text = parent_text[:50] + "..." if len(parent_text) > 50 else parent_text
+            
+            if quoted_text and not isinstance(quoted_text, ForwardInfo):
+                message['quoted_text'] = quoted_text
+        
         # Get media info
         self._get_message_media(message)
         
@@ -256,6 +349,132 @@ class WhatsAppExporter:
         self._check_forwarded_message(message)
         
         self.messages.append(message)
+    
+    def _convert_timestamp(self, timestamp):
+        """Convert WhatsApp timestamp - matches original logic."""
+        if not timestamp:
+            return None
+        try:
+            from datetime import datetime
+            return datetime.fromtimestamp(timestamp + 978307200).strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            return None
+    
+    def _decode_varint(self, blob, start_pos):
+        """Decode a protobuf varint starting at start_pos. Returns (value, next_pos)."""
+        value = 0
+        shift = 0
+        pos = start_pos
+        
+        while pos < len(blob):
+            byte = blob[pos]
+            value |= (byte & 0x7F) << shift
+            pos += 1
+            if (byte & 0x80) == 0:  # No continue bit
+                break
+            shift += 7
+            if shift >= 64:  # Prevent infinite loop
+                break
+        
+        return value, pos
+    
+    def _get_parent_message_text(self, parent_message_id):
+        """Get the text content of a parent message for quote fallback."""
+        try:
+            result = self.db_manager.fetch_one(
+                "SELECT ZTEXT FROM ZWAMESSAGE WHERE Z_PK = ?", 
+                (parent_message_id,)
+            )
+            return result[0] if result and result[0] else None
+        except Exception:
+            return None
+    
+    def _extract_quoted_text(self, media_item_id):
+        """Extract quoted text from media metadata - matches original logic."""
+        try:
+            # First, try to get the media info itself (for media quotes)
+            result = self.db_manager.fetch_one(
+                "SELECT ZMEDIALOCALPATH, ZTITLE, ZMESSAGE FROM ZWAMEDIAITEM WHERE Z_PK = ?", 
+                (media_item_id,)
+            )
+            
+            if result and result[0]:  # Has media path
+                media_path = result[0]
+                media_title = result[1]
+                
+                # Get media type from path extension
+                if media_path:
+                    ext = os.path.splitext(media_path)[1].lower()
+                    if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+                        media_type = "Image"
+                    elif ext in ['.mp4', '.mov', '.avi']:
+                        media_type = "Video"
+                    elif ext in ['.mp3', '.wav', '.m4a']:
+                        media_type = "Audio"
+                    else:
+                        media_type = "Media"
+                    
+                    # If there's a title/comment with the media, include it
+                    if media_title and media_title.strip():
+                        return f"[{media_type}] {media_title.strip()}"
+                    else:
+                        return f"[{media_type}]"
+            
+            # If no direct media info, try to extract from metadata blob
+            result = self.db_manager.fetch_one(
+                "SELECT ZMETADATA FROM ZWAMEDIAITEM WHERE Z_PK = ?", 
+                (media_item_id,)
+            )
+            if not result or not result[0]:
+                return None
+
+            blob = result[0]
+            i = 0
+            
+            while i < len(blob) - 2:
+                tag_byte = blob[i]
+                if (tag_byte & 0x7) == 2:  # Length-delimited field
+                    tag = tag_byte >> 3
+                    length = blob[i + 1]  # Simple byte read like original
+                    
+                    # Check if this looks like a varint (length >= 128)
+                    if length >= 128:
+                        i += 1  # Skip this problematic field
+                        continue
+                    
+                    if i + 2 + length <= len(blob) and length > 2 and tag == 1:
+                        field_data = blob[i + 2:i + 2 + length]
+                        try:
+                            text = field_data.decode('utf-8', errors='ignore').strip()
+                            text = re.sub(r'[\x00-\x1f]+', '', text)
+                            
+                            if len(text) > 3:
+                                # Check for forward hash (only if it really looks like one)
+                                sanitized = re.sub(r"[^A-Za-z0-9'`{}]", "", text)
+                                if (len(sanitized) > 10 and 
+                                    re.fullmatch(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", sanitized) and
+                                    any(c.isdigit() or c in '{}' or (c.isalpha() and c.isupper()) for c in sanitized)):
+                                    from .formatter import ForwardInfo
+                                    return ForwardInfo(sanitized)
+                                
+                                # Regular quote - be more permissive
+                                if len(text) > 3:  # Lower threshold
+                                    if len(text) > 50:
+                                        words = text[:50].split()
+                                        text = ' '.join(words[:-1]) + "..." if len(words) > 1 else text[:50] + "..."
+                                    return text
+                        except Exception:
+                            pass
+                    
+                    i += 2 + length if i + 2 + length <= len(blob) else i + 1
+                else:
+                    i += 1
+            
+            # Last resort: if we reach here, there's no actual quoted content
+            return None
+            
+        except Exception:
+            return None
     
     def _get_group_member_name(self, group_jid, member_id):
         """Get group member name by ID."""
@@ -374,15 +593,113 @@ class WhatsAppExporter:
         # Create message lookup for parent references
         message_lookup = {msg['message_id']: msg for msg in self.messages}
         
-        # Process citations/replies
+        # Step 1: Resolve parent message quotes (like the original code)
         for message in self.messages:
-            if (not message['quoted_text'] and message['parent_message_id'] 
+            if (not message.get('quoted_text') and message.get('parent_message_id') 
                 and message['parent_message_id'] in message_lookup):
                 parent_msg = message_lookup[message['parent_message_id']]
-                quoted_content = parent_msg['content'][:50]
-                if len(parent_msg['content']) > 50:
+                quoted_content = parent_msg['content'][:50] if parent_msg.get('content') else ''
+                if len(parent_msg.get('content', '')) > 50:
                     quoted_content += "..."
                 message['quoted_text'] = quoted_content
+        
+        # Step 2: Parse metadata for replies (like the original code)
+        reply_targets = [m for m in self.messages 
+                        if not m.get('quoted_text') and not m.get('parent_message_id') and m.get('media_item_id')]
+        self._parse_metadata_replies(reply_targets)
+    
+    def _parse_metadata_replies(self, targets):
+        """Parse metadata to find reply relationships (from original code)."""
+        if not targets:
+            return
+        
+        # Get metadata
+        media_ids = [m['media_item_id'] for m in targets if m.get('media_item_id')]
+        if not media_ids:
+            return
+        
+        placeholders = ','.join(['?'] * len(media_ids))
+        query = f"SELECT Z_PK,ZMETADATA FROM ZWAMEDIAITEM WHERE Z_PK IN ({placeholders})"
+        metadata_rows = self.db_manager.fetch_all(query, media_ids)
+        meta_map = {r[0]: r[1] for r in metadata_rows if r[1]}
+        
+        # Index original messages
+        originals = {}
+        for m in self.messages:
+            text = (m.get('content') or '').strip()
+            if len(text) >= 40:
+                originals.setdefault(text[:60], []).append(m)
+        
+        # Process targets
+        for msg in targets:
+            blob = meta_map.get(msg.get('media_item_id'))
+            if not blob:
+                continue
+            
+            # Extract fragments from tags 5,6,9,13,14
+            parts = []
+            i = 0
+            while i < len(blob) - 2:
+                b = blob[i]
+                if (b & 7) == 2 and i + 1 < len(blob):
+                    tag = b >> 3
+                    length = blob[i + 1]
+                    data = blob[i + 2:i + 2 + length]
+                    i += 2 + length
+                    
+                    if 10 < length < 130 and tag in (5, 6, 9, 13, 14):
+                        try:
+                            text = data.decode('utf-8', 'ignore').strip()
+                            if text:
+                                parts.append(text)
+                        except:
+                            pass
+                else:
+                    i += 1
+            
+            if len(parts) < 2:
+                continue
+            
+            # Find matching original
+            reconstruction = ' '.join(parts)
+            best_match = None
+            best_delta = None
+            
+            for key, candidates in originals.items():
+                match_found = any(len(part) > 15 and part in key for part in parts)
+                if not match_found and key[:25] in reconstruction:
+                    match_found = True
+                
+                if match_found:
+                    for candidate in candidates:
+                        if (candidate.get('is_from_me') == msg.get('is_from_me') or
+                            not candidate.get('date') or not msg.get('date')):
+                            continue
+                        
+                        try:
+                            from datetime import datetime
+                            t1 = datetime.strptime(candidate['date'], '%Y-%m-%d %H:%M:%S')
+                            t2 = datetime.strptime(msg['date'], '%Y-%m-%d %H:%M:%S')
+                            if t1 >= t2:
+                                continue
+                            
+                            delta = (t2 - t1).total_seconds()
+                            if delta > 48 * 3600:
+                                continue
+                            
+                            if best_delta is None or delta < best_delta:
+                                best_match = candidate
+                                best_delta = delta
+                        except:
+                            continue
+            
+            # Apply quote
+            if best_match and not msg.get('quoted_text'):
+                content = best_match['content']
+                if len(content) > 90:
+                    words = content[:90].split()
+                    content = ' '.join(words[:-1]) + '...' if len(words) > 1 else content[:85] + '...'
+                msg['quoted_text'] = content
     
     def _generate_filename(self, contact_name):
         """Generate safe filename for export."""

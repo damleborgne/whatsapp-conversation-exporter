@@ -16,10 +16,13 @@ class ForwardInfo:
 class ConversationFormatter:
     """Formats conversations for markdown export."""
     
-    def __init__(self, participant_manager, mood_analyzer):
+    def __init__(self, participant_manager, mood_analyzer, media_base_path=None, backup_mode=False, db_manager=None):
         """Initialize with participant manager and mood analyzer."""
         self.participant_manager = participant_manager
         self.mood_analyzer = mood_analyzer
+        self.media_base_path = media_base_path
+        self.backup_mode = backup_mode
+        self.db_manager = db_manager
     
     def format_conversation(self, messages, contact_name, contact_jid=None):
         """Format conversation for export."""
@@ -168,7 +171,7 @@ class ConversationFormatter:
             content = msg['content']
             if msg.get('is_forwarded'):
                 content = f"(forward) {content}"
-            message_line = f"{indent}[{time_part}] {prefix} {sender_prefix}{content}"
+            message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}{content}"
             if msg['reaction_emoji']:
                 message_line += f" {msg['reaction_emoji']}"
             output.append(message_line)
@@ -177,7 +180,7 @@ class ConversationFormatter:
             if not msg.get('media_info') and not (msg['content'] and msg['content'].strip()):
                 print(f"⚠️ Warning: Empty message found (ID: {msg.get('message_id')}, Type: {msg.get('message_type')})")
                 # Still show it with a placeholder to avoid losing data
-                output.append(f"{indent}[{time_part}] {prefix} {sender_prefix}[Empty message - Type {msg.get('message_type', '?')}]")
+                output.append(f"[{time_part}]{indent} {prefix} {sender_prefix}[Empty message - Type {msg.get('message_type', '?')}]")
     
     def _format_media_message(self, output, msg, time_part, prefix, indent, sender_prefix, contact_name):
         """Format a message with media."""
@@ -194,10 +197,10 @@ class ConversationFormatter:
         if media_path:
             # Media downloaded and available
             filename = os.path.basename(media_path)
-            message_line = f"{indent}[{time_part}] {prefix} {sender_prefix}📎 {media_type}: [{filename}](./{media_path})"
+            message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}📎 {media_type}: [{filename}](./{media_path})"
         else:
             # Media not downloaded locally
-            message_line = f"{indent}[{time_part}] {prefix} {sender_prefix}📎 {media_type}: [Not downloaded]"
+            message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}📎 {media_type}: [Not downloaded]"
         
         if size_kb > 0:
             message_line += f" ({size_kb} KB)"
@@ -241,7 +244,7 @@ class ConversationFormatter:
         output.append(media_line)
     
     def _prepare_media_path(self, contact_name, media_info):
-        """Prepare media path and copy file if needed."""
+        """Prepare media path and copy file if needed - matches original logic."""
         if not media_info or not media_info.get('local_path'):
             return None
             
@@ -251,21 +254,87 @@ class ConversationFormatter:
         safe_contact_name = "".join(c for c in contact_name if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')
         media_dir = f"conversations/media/{safe_contact_name}"
         
-        try:
+        if not os.path.exists(media_dir):
             os.makedirs(media_dir, exist_ok=True)
-            
-            # Generate filename with unique ID
-            file_extension = os.path.splitext(original_path)[1]
-            filename = f"{media_info.get('file_id', 'unknown')}{file_extension}"
-            destination_path = os.path.join(media_dir, filename)
-            
-            # Copy file if it doesn't exist
-            if not os.path.exists(destination_path) and os.path.exists(original_path):
-                shutil.copy2(original_path, destination_path)
+        
+        # Extract filename from original path
+        filename = os.path.basename(original_path)
+        if not filename:
+            # Generate filename from UUID in path
+            import re
+            uuid_match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.\w+)', original_path)
+            if uuid_match:
+                filename = uuid_match.group(1)
+            else:
+                filename = f"media_{media_info.get('message_type', 'unknown')}.unknown"
+        
+        relative_path = f"media/{safe_contact_name}/{filename}"
+        full_target_path = f"conversations/{relative_path}"
+        
+        # Determine source path based on mode
+        if self.backup_mode:
+            # For backup mode, media are organized by contact JID
+            full_source_path = self._get_backup_media_path(original_path, contact_name)
+        else:
+            # Local WhatsApp mode
+            full_source_path = os.path.join(self.media_base_path, original_path) if self.media_base_path else None
+        
+        try:
+            if full_source_path and os.path.exists(full_source_path) and not os.path.exists(full_target_path):
+                shutil.copy2(full_source_path, full_target_path)
                 print(f"   📎 Copied media: {filename}")
-            
-            return destination_path if os.path.exists(destination_path) else None
-            
+            elif os.path.exists(full_target_path):
+                pass  # Media already exists
+            else:
+                pass  # Media not found - will show [Not downloaded]
         except Exception as e:
-            print(f"⚠️ Error preparing media: {e}")
+            print(f"   ⚠️ Could not copy media {filename}: {e}")
+        
+        return relative_path
+    
+    def _get_backup_media_path(self, original_path, contact_name):
+        """Get backup media path for wtsexporter extracted files."""
+        # Extract filename from original path
+        filename = os.path.basename(original_path)
+        if not filename:
             return None
+        
+        # Find contact JID by name
+        if self.db_manager:
+            try:
+                result = self.db_manager.fetch_one(
+                    "SELECT ZCONTACTJID FROM ZWACHATSESSION WHERE ZPARTNERNAME = ?", 
+                    (contact_name,)
+                )
+                if result:
+                    contact_jid = result[0]
+                    # Try to find the file in the backup media structure
+                    possible_paths = [
+                        os.path.join(self.media_base_path, contact_jid, filename),
+                        os.path.join(self.media_base_path, contact_jid.replace('@s.whatsapp.net', ''), filename),
+                    ]
+                    
+                    for path in possible_paths:
+                        if os.path.exists(path):
+                            return path
+                    
+                    # Last resort: scan the media directory for the filename
+                    return self._find_media_in_backup(filename)
+            except Exception:
+                pass
+        
+        return None
+    
+    def _find_media_in_backup(self, filename):
+        """Find media file in backup directory by scanning."""
+        if not self.media_base_path or not os.path.exists(self.media_base_path):
+            return None
+        
+        try:
+            for root, dirs, files in os.walk(self.media_base_path):
+                if filename in files:
+                    return os.path.join(root, filename)
+        except Exception:
+            pass
+        
+        return None

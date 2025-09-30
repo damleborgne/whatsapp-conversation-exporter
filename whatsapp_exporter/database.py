@@ -42,16 +42,68 @@ class DatabaseManager:
         raise FileNotFoundError("❌ WhatsApp database not found")
     
     def _find_backup_database(self):
-        """Find backup database from wtsexporter."""
+        """Find backup database from wtsexporter - uses same logic as original."""
         if not self.backup_base_path:
             raise ValueError("❌ Backup base path required for backup mode")
         
-        chat_db_path = os.path.join(self.backup_base_path, "ChatStorage.sqlite")
-        if os.path.exists(chat_db_path):
-            self.db_path = chat_db_path
-            print(f"✅ Found backup database: {chat_db_path}")
-        else:
-            raise FileNotFoundError(f"❌ Backup database not found at {chat_db_path}")
+        print("🔍 Looking for wtsexporter database...")
+        
+        # Look for files with exactly 40 characters (typical iOS backup hash length)
+        candidate_files = []
+        
+        try:
+            for item in os.listdir(self.backup_base_path):
+                item_path = os.path.join(self.backup_base_path, item)
+                
+                # Check if it's a file with exactly 40 characters and no extension
+                if (os.path.isfile(item_path) and 
+                    len(item) == 40 and 
+                    '.' not in item and 
+                    all(c in '0123456789abcdefABCDEF' for c in item)):
+                    
+                    file_size = os.path.getsize(item_path)
+                    candidate_files.append((item, item_path, file_size))
+                    print(f"   📱 Found candidate: {item} ({file_size:,} bytes)")
+            
+            if candidate_files:
+                # Sort by size and select largest (matches original logic)
+                candidate_files.sort(key=lambda x: x[2], reverse=True)
+                
+                if len(candidate_files) > 1:
+                    print(f"\n📋 Found {len(candidate_files)} database candidates:")
+                    for i, (filename, path, size) in enumerate(candidate_files[:5], 1):
+                        size_mb = size / (1024 * 1024)
+                        print(f"   {i}. {filename} ({size_mb:.1f} MB)")
+                    
+                    print(f"\n💡 Auto-selecting largest file: {candidate_files[0][0]}")
+                
+                chosen_file = candidate_files[0]
+                self.db_path = chosen_file[1]
+                print(f"✅ Using database: {chosen_file[0]} ({chosen_file[2]:,} bytes)")
+                return
+                
+        except Exception as e:
+            print(f"❌ Error scanning backup directory: {e}")
+        
+        # Fallback to ChatStorage.sqlite approach (original fallback logic)
+        print("⚠️ No 40-character files found, trying ChatStorage.sqlite...")
+        possible_paths = [
+            # Direct path
+            os.path.join(self.backup_base_path, "ChatStorage.sqlite"),
+            # In AppDomainGroup folder (wtsexporter structure)
+            os.path.join(self.backup_base_path, "AppDomainGroup-group.net.whatsapp.WhatsApp.shared", "ChatStorage.sqlite"),
+            # In result folder (alternative wtsexporter structure)
+            os.path.join(self.backup_base_path, "result", "AppDomainGroup-group.net.whatsapp.WhatsApp.shared", "ChatStorage.sqlite"),
+        ]
+        
+        for chat_db_path in possible_paths:
+            if os.path.exists(chat_db_path):
+                self.db_path = chat_db_path
+                print(f"✅ Found backup database: {chat_db_path}")
+                return
+        
+        raise FileNotFoundError(f"❌ Backup database not found in {self.backup_base_path}. Searched paths:\n" + 
+                               "\n".join(f"  - {path}" for path in possible_paths))
     
     def get_connection(self):
         """Get database connection (create if needed)."""
