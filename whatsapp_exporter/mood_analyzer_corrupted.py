@@ -1,5 +1,75 @@
 """
+"""
 Mood analysis and timeline generation for WhatsApp conversations.
+"""
+
+import re
+from datetime import datetime, timedelta
+
+
+class MoodAnalyzer:
+    """Analyzes mood evolution based on emojis in messages and reactions over time."""
+    
+    def __init__(self):
+        """Initialize mood analyzer."""
+        # Define mood categories for different emoji reactions AND message content
+        self.mood_categories = {
+            # Positive emotions - Joy/Laughter
+            '😂': 'joy', '🤣': 'joy', '�': 'joy', '�': 'joy', '😁': 'joy', '😀': 'joy', '🤪': 'joy',
+            
+            # Positive emotions - Happiness/Contentment  
+            '�': 'happiness', '�': 'happiness', '�': 'happiness', '😌': 'happiness', '😇': 'happiness', 
+            '☺️': 'happiness', '😸': 'happiness', '😺': 'happiness',
+            
+            # Love/Affection
+            '😍': 'love', '�': 'love', '😘': 'love', '😗': 'love', '😙': 'love', '😚': 'love',
+            '💕': 'love', '❤️': 'love', '💖': 'love', '💗': 'love', '💘': 'love', '💝': 'love',
+            '🤗': 'love', '💋': 'love', '😻': 'love',
+            
+            # Approval/Support
+            '👍': 'approval', '👌': 'approval', '👏': 'approval', '🤝': 'approval', '✨': 'approval',
+            '💯': 'approval', '🆒': 'approval', '✅': 'approval',
+            
+            # Celebration/Excitement
+            '🙌': 'celebration', '🎉': 'celebration', '🥳': 'celebration', '🎊': 'celebration',
+            '🎈': 'celebration', '🎆': 'celebration', '🎇': 'celebration',
+            
+            # Cool/Confidence
+            '😎': 'cool', '🔥': 'excitement', '💪': 'strength', '⚡': 'excitement',
+            
+            # Negative emotions - Sadness/Disappointment
+            '😢': 'sadness', '😭': 'sadness', '😞': 'sadness', '😔': 'disappointment', '☹️': 'sadness',
+            '�': 'sadness', '�': 'sadness', '�': 'sadness', '�': 'sadness', '�': 'disappointment',
+            
+            # Negative emotions - Anger/Frustration
+            '😠': 'anger', '😡': 'anger', '🤬': 'anger', '😤': 'anger', '💢': 'anger',
+            '🔴': 'anger', '😾': 'anger',
+
+            # Fear/Shock/Anxiety
+            '😱': 'shock', '😨': 'fear', '😰': 'anxiety', '😟': 'anxiety', '😧': 'fear',
+            '🙀': 'shock', '�': 'anxiety', '😵': 'shock', '🥶': 'fear',
+            
+            # Surprise/Wonder
+            '😮': 'surprise', '�': 'surprise', '😲': 'surprise', '🤯': 'shock', '😳': 'surprise',
+            
+            # Thinking/Contemplation
+            '🤔': 'thinking', '🧐': 'thinking', '🤨': 'skepticism', '💭': 'thinking',
+            
+            # Confusion/Uncertainty
+            '🤷': 'confusion', '😕': 'confusion', '😵‍💫': 'confusion', '🙃': 'confusion',
+            
+            # Neutral/Indifferent
+            '😐': 'neutral', '😑': 'neutral', '😶': 'neutral', '🫤': 'neutral',
+            
+            # Skepticism/Dismissal
+            '🙄': 'skepticism', '😒': 'skepticism',
+            
+            # Tiredness/Boredom
+            '😴': 'tired', '🥱': 'tired',
+            
+            # Playful/Mischievous
+            '😜': 'playful', '😝': 'playful', '😛': 'playful', '🤭': 'playful',
+        }
 """
 
 import re
@@ -17,7 +87,7 @@ class MoodAnalyzer:
             '😂': 'joy', '🤣': 'joy', '😄': 'joy', '😆': 'joy', '😁': 'joy', '😀': 'joy', '🤪': 'joy',
             
             # Positive emotions - Happiness/Contentment  
-            '😊': 'happiness', '🙂': 'happiness', '😋': 'happiness', '😌': 'happiness', '😇': 'happiness', 
+            '😊': 'happiness', '�': 'happiness', '�😋': 'happiness', '😌': 'happiness', '😇': 'happiness', 
             '☺️': 'happiness', '😸': 'happiness', '😺': 'happiness',
             
             # Love/Affection
@@ -26,11 +96,11 @@ class MoodAnalyzer:
             '🤗': 'love', '💋': 'love', '😻': 'love',
             
             # Approval/Support
-            '👍': 'approval', '👌': 'approval', '👏': 'approval', '🤝': 'approval', '✨': 'approval',
-            '💯': 'approval', '🆒': 'approval', '✅': 'approval',
+            '👍': 'approval', '�': 'approval', '👏': 'approval', '🤝': 'approval', '✨': 'approval',
+            '�': 'approval', '🆒': 'approval', '✅': 'approval',
             
             # Celebration/Excitement
-            '🙌': 'celebration', '🎉': 'celebration', '🥳': 'celebration', '🎊': 'celebration',
+            '�🙌': 'celebration', '🎉': 'celebration', '🥳': 'celebration', '🎊': 'celebration',
             '🎈': 'celebration', '🎆': 'celebration', '🎇': 'celebration',
             
             # Cool/Confidence
@@ -58,13 +128,13 @@ class MoodAnalyzer:
             '🤷': 'confusion', '😕': 'confusion', '😵‍💫': 'confusion', '🙃': 'confusion',
             
             # Neutral/Indifferent
-            '😐': 'neutral', '😑': 'neutral', '😶': 'neutral', '🫤': 'neutral',
+            '😐': 'neutral', '😑': 'neutral', '�': 'neutral', '🫤': 'neutral',
             
             # Skepticism/Dismissal
-            '🙄': 'skepticism', '😒': 'skepticism',
+            '�🙄': 'skepticism', '😒': 'skepticism', '😤': 'skepticism',
             
             # Tiredness/Boredom
-            '😴': 'tired', '🥱': 'tired',
+            '😴': 'tired', '🥱': 'tired', '😪': 'tired',
             
             # Playful/Mischievous
             '😜': 'playful', '😝': 'playful', '😛': 'playful', '🤭': 'playful',
