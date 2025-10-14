@@ -247,8 +247,8 @@ class WhatsAppExporter:
                 LEFT JOIN ZWAMESSAGEINFO i ON m.Z_PK = i.ZMESSAGE
                 LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
                 WHERE (m.ZFROMJID = ? OR m.ZTOJID = ?)
-                AND m.ZMESSAGETYPE IN (0, 1, 2, 3, 5, 9, 13, 14)
-                AND (m.ZTEXT IS NOT NULL OR m.ZMEDIAITEM IS NOT NULL)
+                -- Exclude system messages: 6, 10, 15 = empty system notifications (group changes, status updates, etc.)
+                AND m.ZMESSAGETYPE NOT IN (6, 10, 15)
                 ORDER BY m.ZMESSAGEDATE {}
             """.format("DESC" if recent else "ASC")
             
@@ -307,8 +307,16 @@ class WhatsAppExporter:
         
         # Handle media info
         if message['media_item_id']:
+            # Special case for voice/video calls (type 59)
+            if message['message_type'] == 59:
+                message['media_info'] = {
+                    'local_path': None,
+                    'title': 'Appel vocal/vidéo',
+                    'file_size': 0,
+                    'message_type': 59
+                }
             # Only create media_info if there's actual media content
-            if (message['media_local_path'] or 
+            elif (message['media_local_path'] or 
                 (message['media_file_size'] and message['media_file_size'] > 0) or 
                 (message['media_title'] and message['media_title'].strip())):
                 message['media_info'] = {
@@ -322,8 +330,8 @@ class WhatsAppExporter:
         if contact_jid.endswith('@g.us') and message['group_member_id']:
             message['sender_name'] = self._get_group_member_name(contact_jid, message['group_member_id'])
         
-        # Get reaction info
-        self._get_message_reactions(message)
+        # Get reaction info - pass contact_jid for group reaction support
+        self._get_message_reactions(message, contact_jid)
         
         # Extract quoted text - only for messages that are actually quotes/replies (matches original logic)
         if message['parent_message_id']:
@@ -499,7 +507,7 @@ class WhatsAppExporter:
         except Exception:
             return f"Member {member_id}"
     
-    def _get_message_reactions(self, message):
+    def _get_message_reactions(self, message, contact_jid=None):
         """Get reaction information for a message."""
         try:
             result = self.db_manager.fetch_one("""
@@ -510,41 +518,111 @@ class WhatsAppExporter:
             
             if result and result[0]:
                 receipt_info = result[0]
-                emoji = self._extract_reaction_emoji(receipt_info)
+                is_group = contact_jid and contact_jid.endswith('@g.us')
+                emoji = self._extract_reaction_emoji(receipt_info, is_group, contact_jid)
                 if emoji:
                     message['reaction_emoji'] = emoji
         except Exception:
             pass
     
-    def _extract_reaction_emoji(self, receipt_info):
-        """Extract reaction emoji from receipt info."""
+    def _extract_reaction_emoji(self, receipt_info, is_group=False, group_jid=None):
+        """Extract reaction emoji from receipt info with group support."""
+        if not receipt_info:
+            return None
+            
         try:
             if isinstance(receipt_info, bytes):
                 hex_data = receipt_info.hex().upper()
             else:
-                hex_data = receipt_info
+                hex_data = str(receipt_info).upper()
             
-            # Look for emoji patterns in hex
-            emoji_patterns = [
-                'F09F988D',  # 😍
-                'F09F9882',  # 😂
-                'F09F98AE',  # 😮
-                'F09F918D',  # 👍
-                # Add more patterns as needed
-            ]
+            # Find emoji with automatic modifier detection
+            emoji = None
+            if 'F09F' in hex_data:
+                # Modern emojis (F09F prefix) - may have skin tone modifiers
+                base_matches = re.findall(r'F09F[0-9A-F]{4}', hex_data)
+                if base_matches:
+                    # Check for skin tone modifier after base emoji
+                    base_emoji = base_matches[0]
+                    base_pos = hex_data.find(base_emoji)
+                    remaining = hex_data[base_pos + len(base_emoji):]
+                    
+                    # Look for skin tone modifier (F09F8F[BB-BF])
+                    skin_modifier_match = re.match(r'F09F8F(BB|BC|BD|BE|BF)', remaining)
+                    if skin_modifier_match:
+                        full_sequence = base_emoji + skin_modifier_match.group(0)
+                        emoji = bytes.fromhex(full_sequence).decode('utf-8')
+                    else:
+                        emoji = bytes.fromhex(base_emoji).decode('utf-8')
+                        
+            elif 'E2' in hex_data:
+                # Legacy Unicode symbols (E2xx prefix) - may have color modifiers
+                base_matches = re.findall(r'E2[0-9A-F]{4}', hex_data)
+                if base_matches:
+                    base_emoji = base_matches[0]
+                    base_pos = hex_data.find(base_emoji)
+                    remaining = hex_data[base_pos + len(base_emoji):]
+                    
+                    # Look for color modifier (EFB8[8F-AB])
+                    color_modifier_match = re.match(r'EFB8[8-9A-B][0-9A-F]', remaining)
+                    if color_modifier_match:
+                        full_sequence = base_emoji + color_modifier_match.group(0)
+                        emoji = bytes.fromhex(full_sequence).decode('utf-8')
+                    else:
+                        emoji = bytes.fromhex(base_emoji).decode('utf-8')
             
-            for pattern in emoji_patterns:
-                if pattern in hex_data:
-                    # Convert hex back to emoji
-                    try:
-                        emoji_bytes = bytes.fromhex(pattern)
-                        return emoji_bytes.decode('utf-8')
-                    except:
-                        continue
+            if not emoji:
+                return None
             
+            # For groups, try to extract who reacted
+            if is_group and group_jid:
+                return self._decode_group_reactions(hex_data, emoji, group_jid)
+            else:
+                return emoji
+                
+        except Exception:
             return None
-        except:
-            return None
+    
+    def _decode_group_reactions(self, hex_data, emoji, group_jid):
+        """Decode group reactions with person initials."""
+        try:
+            # Find JID patterns in hex data
+            jid_matches = re.findall(r'333[0-9A-F]+?40732E77686174736170702E6E6574', hex_data)
+            
+            if not jid_matches:
+                return emoji
+            
+            reactors = []
+            for jid_hex in jid_matches:
+                try:
+                    # Decode JID
+                    jid_bytes = bytes.fromhex(jid_hex)
+                    jid_raw = jid_bytes.decode('utf-8', errors='ignore')
+                    
+                    # Extract clean phone number
+                    phone_match = re.search(r'(\d+)@s\.whatsapp\.net', jid_raw)
+                    if phone_match:
+                        phone = phone_match.group(1)
+                        clean_jid = f'{phone}@s.whatsapp.net'
+                        
+                        # Get initials for this person in this group
+                        initials = self.participant_manager.get_group_initials_for_jid(group_jid, clean_jid)
+                        if initials and initials not in reactors:
+                            reactors.append(initials)
+                except Exception:
+                    continue
+            
+            if reactors:
+                if len(reactors) == 1:
+                    return f"[{reactors[0]}:{emoji}]"
+                else:
+                    reactor_list = ';'.join([f"{r}:{emoji}" for r in reactors])
+                    return f"[{reactor_list}]"
+            
+            return emoji
+            
+        except Exception:
+            return emoji
     
     def _get_message_media(self, message):
         """Get media information for a message."""

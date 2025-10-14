@@ -158,11 +158,20 @@ class ConversationFormatter:
         if reply_content.strip():
             message_line = f"{indent}           {prefix} {sender_prefix}{reply_content}"
             if msg['reaction_emoji']:
-                message_line += f" {msg['reaction_emoji']}"
+                message_line += f" [{msg['reaction_emoji']}]"
             output.append(message_line)
     
     def _format_regular_message(self, output, msg, time_part, prefix, indent, sender_prefix, contact_name):
         """Format a regular message (no citation)."""
+        # Handle voice/video calls (type 59)
+        if msg.get('message_type') == 59:
+            direction = "📞 Appel sortant" if msg.get('is_from_me') else "📞 Appel entrant"
+            message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}{direction}"
+            if msg['reaction_emoji']:
+                message_line += f" [{msg['reaction_emoji']}]"
+            output.append(message_line)
+            return
+        
         # Regular message - handle media first, then text
         if msg.get('media_info'):
             self._format_media_message(output, msg, time_part, prefix, indent, sender_prefix, contact_name)
@@ -173,7 +182,7 @@ class ConversationFormatter:
                 content = f"(forward) {content}"
             message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}{content}"
             if msg['reaction_emoji']:
-                message_line += f" {msg['reaction_emoji']}"
+                message_line += f" [{msg['reaction_emoji']}]"
             output.append(message_line)
         else:
             # This should never happen - warn about completely empty messages
@@ -185,6 +194,15 @@ class ConversationFormatter:
     def _format_media_message(self, output, msg, time_part, prefix, indent, sender_prefix, contact_name):
         """Format a message with media."""
         from .utils import get_media_type_name
+        
+        # Handle voice/video calls (type 59)
+        if msg.get('message_type') == 59:
+            direction = "📞 Appel sortant" if msg.get('is_from_me') else "📞 Appel entrant"
+            message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}{direction}"
+            if msg['reaction_emoji']:
+                message_line += f" [{msg['reaction_emoji']}]"
+            output.append(message_line)
+            return
         
         # Always show media with its filename
         media_type = get_media_type_name(msg['media_info'].get('message_type', 0))
@@ -207,7 +225,7 @@ class ConversationFormatter:
         if msg['media_info'].get('title'):
             message_line += f" - {msg['media_info']['title']}"
         if msg['reaction_emoji']:
-            message_line += f" {msg['reaction_emoji']}"
+            message_line += f" [{msg['reaction_emoji']}]"
         
         output.append(message_line)
         
