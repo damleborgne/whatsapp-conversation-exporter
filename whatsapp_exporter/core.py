@@ -333,22 +333,24 @@ class WhatsAppExporter:
         # Get reaction info - pass contact_jid for group reaction support
         self._get_message_reactions(message, contact_jid)
         
-        # Extract quoted text - only for messages that are actually quotes/replies (matches original logic)
-        if message['parent_message_id']:
-            # First try the complex metadata extraction
-            quoted_text = None
-            if message['media_item_id']:  # has media_item_id, try to extract from metadata
-                quoted_text = self._extract_quoted_text(message['media_item_id'])
-            
-            # If metadata extraction failed, fallback to parent message text
-            if not quoted_text:
-                parent_text = self._get_parent_message_text(message['parent_message_id'])
-                if parent_text:
-                    # Take first 50 characters of parent message
-                    quoted_text = parent_text[:50] + "..." if len(parent_text) > 50 else parent_text
-            
-            if quoted_text and not isinstance(quoted_text, ForwardInfo):
-                message['quoted_text'] = quoted_text
+        # Extract quoted text - check both parent_message_id AND media_item metadata
+        # Some messages have citations in metadata without parent_message_id being set
+        quoted_text = None
+        
+        # First, try extracting from metadata if media_item exists
+        if message['media_item_id']:
+            quoted_text = self._extract_quoted_text(message['media_item_id'])
+        
+        # If no citation found yet and we have a parent_message_id, fallback to parent text
+        if not quoted_text and message['parent_message_id']:
+            parent_text = self._get_parent_message_text(message['parent_message_id'])
+            if parent_text:
+                # Take first 50 characters of parent message
+                quoted_text = parent_text[:50] + "..." if len(parent_text) > 50 else parent_text
+        
+        # Store the citation if found
+        if quoted_text and not isinstance(quoted_text, ForwardInfo):
+            message['quoted_text'] = quoted_text
         
         # Get media info
         self._get_message_media(message)
@@ -437,27 +439,28 @@ class WhatsAppExporter:
                 return None
 
             blob = result[0]
-            i = 0
             
-            while i < len(blob) - 2:
-                tag_byte = blob[i]
-                if (tag_byte & 0x7) == 2:  # Length-delimited field
-                    tag = tag_byte >> 3
-                    length = blob[i + 1]  # Simple byte read like original
+            # Try to find tag 1 specifically (most reliable citation tag)
+            # Tag 1 with wire type 2 = 0x0a
+            i = 0
+            while i < len(blob) - 3:
+                if blob[i] == 0x0a and (blob[i] & 0x7) == 2:  # Tag 1, wire type 2
+                    # Decode the length
+                    length_byte = blob[i + 1]
+                    if length_byte < 128:
+                        length = length_byte
+                        data_start = i + 2
+                    else:
+                        # Multi-byte varint
+                        length, data_start = self._decode_varint(blob, i + 1)
                     
-                    # Check if this looks like a varint (length >= 128)
-                    if length >= 128:
-                        i += 1  # Skip this problematic field
-                        continue
-                    
-                    if i + 2 + length <= len(blob) and length > 2 and tag == 1:
-                        field_data = blob[i + 2:i + 2 + length]
+                    if data_start + length <= len(blob) and length > 10:
                         try:
-                            text = field_data.decode('utf-8', errors='ignore').strip()
+                            text = blob[data_start:data_start + length].decode('utf-8', errors='ignore').strip()
                             text = re.sub(r'[\x00-\x1f]+', '', text)
                             
                             if len(text) > 3:
-                                # Check for forward hash (only if it really looks like one)
+                                # Check for forward hash
                                 sanitized = re.sub(r"[^A-Za-z0-9'`{}]", "", text)
                                 if (len(sanitized) > 10 and 
                                     re.fullmatch(r"[A-Za-z0-9]{2,24}['`][A-Za-z0-9{}]{2,48}", sanitized) and
@@ -465,20 +468,49 @@ class WhatsAppExporter:
                                     from .formatter import ForwardInfo
                                     return ForwardInfo(sanitized)
                                 
-                                # Regular quote - be more permissive
-                                if len(text) > 3:  # Lower threshold
-                                    if len(text) > 50:
-                                        words = text[:50].split()
-                                        text = ' '.join(words[:-1]) + "..." if len(words) > 1 else text[:50] + "..."
-                                    return text
-                        except Exception:
+                                # Valid quote found
+                                if len(text) > 50:
+                                    words = text[:50].split()
+                                    text = ' '.join(words[:-1]) + "..." if len(words) > 1 else text[:50] + "..."
+                                return text
+                        except:
                             pass
-                    
-                    i += 2 + length if i + 2 + length <= len(blob) else i + 1
-                else:
-                    i += 1
+                i += 1
             
-            # Last resort: if we reach here, there's no actual quoted content
+            # Fallback: look for other tags (0, 2, 3, 4) if tag 1 not found
+            i = 0
+            best_match = None
+            while i < len(blob) - 2:
+                tag_byte = blob[i]
+                if (tag_byte & 0x7) == 2:  # Length-delimited field
+                    tag = tag_byte >> 3
+                    
+                    if tag <= 4 and tag != 1:  # Skip tag 1 (already checked above)
+                        length_byte = blob[i + 1]
+                        if length_byte < 128:
+                            length = length_byte
+                            data_start = i + 2
+                            
+                            if data_start + length <= len(blob) and 10 < length < 500:
+                                try:
+                                    text = blob[data_start:data_start + length].decode('utf-8', errors='ignore').strip()
+                                    text = re.sub(r'[\x00-\x1f]+', '', text)
+                                    
+                                    if len(text) > 3 and not best_match:
+                                        best_match = text
+                                except:
+                                    pass
+                            
+                            i += data_start + length
+                            continue
+                i += 1
+            
+            if best_match:
+                if len(best_match) > 50:
+                    words = best_match[:50].split()
+                    best_match = ' '.join(words[:-1]) + "..." if len(words) > 1 else best_match[:50] + "..."
+                return best_match
+            
             return None
             
         except Exception:
