@@ -333,20 +333,19 @@ class WhatsAppExporter:
         # Get reaction info - pass contact_jid for group reaction support
         self._get_message_reactions(message, contact_jid)
         
-        # Extract quoted text - check both parent_message_id AND media_item metadata
-        # Some messages have citations in metadata without parent_message_id being set
+        # Extract quoted text from protobuf metadata (100% systematic extraction)
+        # Citations can be stored either in the message's media_item or in the parent's media_item
         quoted_text = None
         
-        # First, try extracting from metadata if media_item exists
+        # First, try extracting from message's own media_item
         if message['media_item_id']:
             quoted_text = self._extract_quoted_text(message['media_item_id'])
         
-        # If no citation found yet and we have a parent_message_id, fallback to parent text
+        # If no citation found and we have a parent_message_id, check parent's media_item
         if not quoted_text and message['parent_message_id']:
-            parent_text = self._get_parent_message_text(message['parent_message_id'])
-            if parent_text:
-                # Take first 50 characters of parent message
-                quoted_text = parent_text[:50] + "..." if len(parent_text) > 50 else parent_text
+            parent_media_id = self._get_parent_message_media_id(message['parent_message_id'])
+            if parent_media_id:
+                quoted_text = self._extract_quoted_text(parent_media_id)
         
         # Store the citation if found
         if quoted_text and not isinstance(quoted_text, ForwardInfo):
@@ -388,11 +387,11 @@ class WhatsAppExporter:
         
         return value, pos
     
-    def _get_parent_message_text(self, parent_message_id):
-        """Get the text content of a parent message for quote fallback."""
+    def _get_parent_message_media_id(self, parent_message_id):
+        """Get the media_item_id from parent message (if it has one)."""
         try:
             result = self.db_manager.fetch_one(
-                "SELECT ZTEXT FROM ZWAMESSAGE WHERE Z_PK = ?", 
+                "SELECT ZMEDIAITEM FROM ZWAMESSAGE WHERE Z_PK = ?",
                 (parent_message_id,)
             )
             return result[0] if result and result[0] else None
@@ -400,7 +399,7 @@ class WhatsAppExporter:
             return None
     
     def _extract_quoted_text(self, media_item_id):
-        """Extract quoted text from media metadata - matches original logic."""
+        """Extract quoted text from media metadata - 100% systematic extraction from protobuf."""
         try:
             # First, try to get the media info itself (for media quotes)
             result = self.db_manager.fetch_one(
