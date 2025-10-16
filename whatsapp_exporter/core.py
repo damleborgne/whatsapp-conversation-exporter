@@ -573,34 +573,53 @@ class WhatsAppExporter:
                 # Modern emojis (F09F prefix) - may have skin tone modifiers
                 base_matches = re.findall(r'F09F[0-9A-F]{4}', hex_data)
                 if base_matches:
-                    # Check for skin tone modifier after base emoji
-                    base_emoji = base_matches[0]
-                    base_pos = hex_data.find(base_emoji)
-                    remaining = hex_data[base_pos + len(base_emoji):]
-                    
-                    # Look for skin tone modifier (F09F8F[BB-BF])
-                    skin_modifier_match = re.match(r'F09F8F(BB|BC|BD|BE|BF)', remaining)
-                    if skin_modifier_match:
-                        full_sequence = base_emoji + skin_modifier_match.group(0)
-                        emoji = bytes.fromhex(full_sequence).decode('utf-8')
-                    else:
-                        emoji = bytes.fromhex(base_emoji).decode('utf-8')
+                    # Try each match until we find a valid emoji
+                    for base_emoji in base_matches:
+                        try:
+                            base_pos = hex_data.find(base_emoji)
+                            remaining = hex_data[base_pos + len(base_emoji):]
+                            
+                            # Look for skin tone modifier (F09F8F[BB-BF])
+                            skin_modifier_match = re.match(r'F09F8F(BB|BC|BD|BE|BF)', remaining)
+                            if skin_modifier_match:
+                                full_sequence = base_emoji + skin_modifier_match.group(0)
+                                emoji = bytes.fromhex(full_sequence).decode('utf-8')
+                            else:
+                                emoji = bytes.fromhex(base_emoji).decode('utf-8')
+                            
+                            # If we successfully decoded an emoji, break
+                            if emoji:
+                                break
+                        except:
+                            # This match wasn't a valid emoji, try next one
+                            continue
                         
             elif 'E2' in hex_data:
                 # Legacy Unicode symbols (E2xx prefix) - may have color modifiers
-                base_matches = re.findall(r'E2[0-9A-F]{4}', hex_data)
+                # Match 6 hex chars (3 bytes): E2 + 2 more bytes
+                # Valid ranges: E2[8-9A-B][0-9A-F]{3} (captures all E280-E2BF)
+                base_matches = re.findall(r'E2[8-9A-B][0-9A-F][0-9A-F]{2}', hex_data)
                 if base_matches:
-                    base_emoji = base_matches[0]
-                    base_pos = hex_data.find(base_emoji)
-                    remaining = hex_data[base_pos + len(base_emoji):]
-                    
-                    # Look for color modifier (EFB8[8F-AB])
-                    color_modifier_match = re.match(r'EFB8[8-9A-B][0-9A-F]', remaining)
-                    if color_modifier_match:
-                        full_sequence = base_emoji + color_modifier_match.group(0)
-                        emoji = bytes.fromhex(full_sequence).decode('utf-8')
-                    else:
-                        emoji = bytes.fromhex(base_emoji).decode('utf-8')
+                    # Try each match until we find a valid emoji
+                    for base_emoji in base_matches:
+                        try:
+                            base_pos = hex_data.find(base_emoji)
+                            remaining = hex_data[base_pos + len(base_emoji):]
+                            
+                            # Look for color modifier (EFB8[8F-AB])
+                            color_modifier_match = re.match(r'EFB8[8-9A-B][0-9A-F]', remaining)
+                            if color_modifier_match:
+                                full_sequence = base_emoji + color_modifier_match.group(0)
+                                emoji = bytes.fromhex(full_sequence).decode('utf-8')
+                            else:
+                                emoji = bytes.fromhex(base_emoji).decode('utf-8')
+                            
+                            # If we successfully decoded an emoji, break
+                            if emoji:
+                                break
+                        except:
+                            # This match wasn't a valid emoji, try next one
+                            continue
             
             if not emoji:
                 return None

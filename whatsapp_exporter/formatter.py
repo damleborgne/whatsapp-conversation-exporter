@@ -242,6 +242,15 @@ class ConversationFormatter:
         """Format media within a quoted message."""
         from .utils import get_media_type_name
         
+        # Handle voice/video calls (type 59) - special case
+        if msg.get('message_type') == 59:
+            direction = "📞 Appel sortant" if msg.get('is_from_me') else "📞 Appel entrant"
+            call_line = f"{indent}           {direction}"
+            if msg.get('reaction_emoji'):
+                call_line += f" [{msg['reaction_emoji']}]"
+            output.append(call_line)
+            return
+        
         media_type = get_media_type_name(msg['media_info'].get('message_type', 0))
         size_kb = msg['media_info'].get('file_size', 0) // 1024 if msg['media_info'].get('file_size') else 0
         
@@ -259,6 +268,8 @@ class ConversationFormatter:
             media_line += f" ({size_kb} KB)"
         if msg['media_info'].get('title'):
             media_line += f" - {msg['media_info']['title']}"
+        if msg.get('reaction_emoji'):
+            media_line += f" [{msg['reaction_emoji']}]"
         output.append(media_line)
     
     def _prepare_media_path(self, contact_name, media_info):
