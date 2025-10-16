@@ -112,7 +112,7 @@ class ConversationFormatter:
             except:
                 time_part = "??:??"
             
-            prefix = ">" if msg['is_from_me'] else "<"
+            prefix = ">>" if msg['is_from_me'] else "<"
             
             # Remove indentation for better readability - all messages aligned to left
             indent = ""
@@ -156,10 +156,22 @@ class ConversationFormatter:
         # Add the reply message below with proper indentation and sender prefix
         reply_content = msg['content'] or ''
         if reply_content.strip():
-            message_line = f"{indent}           {prefix} {sender_prefix}{reply_content}"
-            if msg['reaction_emoji']:
+            # Handle multi-line replies
+            lines = reply_content.split('\n')
+            message_line = f"{indent}           {prefix} {sender_prefix}{lines[0]}"
+            if len(lines) == 1 and msg['reaction_emoji']:
+                # Single line: add reaction immediately
                 message_line += f" [{msg['reaction_emoji']}]"
             output.append(message_line)
+            
+            # Add continuation lines
+            for i, extra_line in enumerate(lines[1:], 1):
+                is_last = (i == len(lines) - 1)
+                continuation = f"{indent}           {prefix} {extra_line}"
+                if is_last and msg['reaction_emoji']:
+                    # Add reaction to last line
+                    continuation += f" [{msg['reaction_emoji']}]"
+                output.append(continuation)
     
     def _format_regular_message(self, output, msg, time_part, prefix, indent, sender_prefix, contact_name):
         """Format a regular message (no citation)."""
@@ -180,10 +192,23 @@ class ConversationFormatter:
             content = msg['content']
             if msg.get('is_forwarded'):
                 content = f"(forward) {content}"
-            message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}{content}"
-            if msg['reaction_emoji']:
+            
+            # Handle multi-line messages: split and indent continuation lines
+            lines = content.split('\n')
+            message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}{lines[0]}"
+            if len(lines) == 1 and msg['reaction_emoji']:
+                # Single line: add reaction immediately
                 message_line += f" [{msg['reaction_emoji']}]"
             output.append(message_line)
+            
+            # Add continuation lines with proper indentation
+            for i, extra_line in enumerate(lines[1:], 1):
+                is_last = (i == len(lines) - 1)
+                continuation = f"           {prefix} {extra_line}"
+                if is_last and msg['reaction_emoji']:
+                    # Add reaction to last line
+                    continuation += f" [{msg['reaction_emoji']}]"
+                output.append(continuation)
         else:
             # This should never happen - warn about completely empty messages
             if not msg.get('media_info') and not (msg['content'] and msg['content'].strip()):
@@ -235,8 +260,13 @@ class ConversationFormatter:
             content = f"(forward) {content}"
         
         if content.strip():
-            comment_line = f"{indent}    💬 {content}"
+            # Handle multi-line content for media captions
+            lines = content.split('\n')
+            comment_line = f"{indent}    💬 {lines[0]}"
             output.append(comment_line)
+            # Add continuation lines
+            for extra_line in lines[1:]:
+                output.append(f"{indent}       {extra_line}")
     
     def _format_media_in_quote(self, output, msg, indent, contact_name):
         """Format media within a quoted message."""
