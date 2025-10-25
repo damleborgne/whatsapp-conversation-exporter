@@ -24,6 +24,16 @@ class ConversationFormatter:
         self.backup_mode = backup_mode
         self.db_manager = db_manager
     
+    def _format_reaction(self, reaction_emoji):
+        """Format reaction emoji - add brackets only if not already present."""
+        if not reaction_emoji:
+            return ""
+        # If reaction already has brackets (group reactions with initials), don't add more
+        if reaction_emoji.startswith('['):
+            return f" {reaction_emoji}"
+        # For simple emojis, add brackets
+        return f" [{reaction_emoji}]"
+    
     def format_conversation(self, messages, contact_name, contact_jid=None):
         """Format conversation for export."""
         if not messages:
@@ -62,9 +72,18 @@ class ConversationFormatter:
                 
                 for participant in participants_sorted:
                     if participant['name'] == 'Moi':
-                        # Show "Moi" with phone number if available
+                        # Show "Moi" with phone number and initials if available
+                        phone_display = None
                         if participant['formatted_phone'] and participant['formatted_phone'] not in ['Moi', 'Mon numéro']:
-                            output.append(f"• {participant['name']} ({participant['formatted_phone']})")
+                            phone_display = participant['formatted_phone']
+                        
+                        # Build display string
+                        if phone_display and participant.get('initials'):
+                            output.append(f"• {participant['name']} ({phone_display}) [{participant['initials']}]")
+                        elif phone_display:
+                            output.append(f"• {participant['name']} ({phone_display})")
+                        elif participant.get('initials'):
+                            output.append(f"• {participant['name']} [{participant['initials']}]")
                         else:
                             output.append(f"• {participant['name']}")
                     else:
@@ -72,9 +91,14 @@ class ConversationFormatter:
                         if participant['name'] == "Inconnu" and participant['formatted_phone'] != "Numéro inconnu":
                             output.append(f"• {participant['formatted_phone']}")
                         else:
-                            # Show name with phone number
+                            # Show name with phone number and initials
                             phone_display = participant['formatted_phone'] if participant['formatted_phone'] != "Numéro inconnu" else "Numéro inconnu"
-                            output.append(f"• {participant['name']} ({phone_display})")
+                            
+                            # Add initials if available
+                            if participant.get('initials'):
+                                output.append(f"• {participant['name']} ({phone_display}) [{participant['initials']}]")
+                            else:
+                                output.append(f"• {participant['name']} ({phone_display})")
         
         output.append("=" * 80)
         output.append("")
@@ -161,7 +185,7 @@ class ConversationFormatter:
             message_line = f"{indent}           {prefix} {sender_prefix}{lines[0]}"
             if len(lines) == 1 and msg['reaction_emoji']:
                 # Single line: add reaction immediately
-                message_line += f" [{msg['reaction_emoji']}]"
+                message_line += self._format_reaction(msg['reaction_emoji'])
             output.append(message_line)
             
             # Add continuation lines
@@ -170,7 +194,7 @@ class ConversationFormatter:
                 continuation = f"{indent}           {prefix} {extra_line}"
                 if is_last and msg['reaction_emoji']:
                     # Add reaction to last line
-                    continuation += f" [{msg['reaction_emoji']}]"
+                    continuation += self._format_reaction(msg['reaction_emoji'])
                 output.append(continuation)
     
     def _format_regular_message(self, output, msg, time_part, prefix, indent, sender_prefix, contact_name):
@@ -180,7 +204,7 @@ class ConversationFormatter:
             direction = "📞 Appel sortant" if msg.get('is_from_me') else "📞 Appel entrant"
             message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}{direction}"
             if msg['reaction_emoji']:
-                message_line += f" [{msg['reaction_emoji']}]"
+                message_line += self._format_reaction(msg['reaction_emoji'])
             output.append(message_line)
             return
         
@@ -198,7 +222,7 @@ class ConversationFormatter:
             message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}{lines[0]}"
             if len(lines) == 1 and msg['reaction_emoji']:
                 # Single line: add reaction immediately
-                message_line += f" [{msg['reaction_emoji']}]"
+                message_line += self._format_reaction(msg['reaction_emoji'])
             output.append(message_line)
             
             # Add continuation lines with proper indentation
@@ -207,12 +231,19 @@ class ConversationFormatter:
                 continuation = f"           {prefix} {extra_line}"
                 if is_last and msg['reaction_emoji']:
                     # Add reaction to last line
-                    continuation += f" [{msg['reaction_emoji']}]"
+                    continuation += self._format_reaction(msg['reaction_emoji'])
                 output.append(continuation)
         else:
             # This should never happen - warn about completely empty messages
             if not msg.get('media_info') and not (msg['content'] and msg['content'].strip()):
-                print(f"⚠️ Warning: Empty message found (ID: {msg.get('message_id')}, Type: {msg.get('message_type')})")
+                msg_date = msg.get('date', 'Date inconnue')
+                print(f"⚠️ Warning: Empty message found")
+                print(f"   ID: {msg.get('message_id')}, Type: {msg.get('message_type')}")
+                print(f"   Date/Time: {msg_date}")
+                print(f"   Content: '{msg.get('content', '')}'")
+                print(f"   Media item ID: {msg.get('media_item_id')}")
+                print(f"   Media info: {msg.get('media_info')}")
+                print(f"   Is from me: {msg.get('is_from_me')}")
                 # Still show it with a placeholder to avoid losing data
                 output.append(f"[{time_part}]{indent} {prefix} {sender_prefix}[Empty message - Type {msg.get('message_type', '?')}]")
     
@@ -220,12 +251,43 @@ class ConversationFormatter:
         """Format a message with media."""
         from .utils import get_media_type_name
         
+        # Handle location messages (type 5)
+        if msg.get('message_type') == 5:
+            media_info = msg.get('media_info', {})
+            lat = media_info.get('latitude')
+            lon = media_info.get('longitude')
+            
+            if lat and lon and lat != 0 and lon != 0:
+                # Create Apple Maps link
+                maps_url = f"https://maps.apple.com/?ll={lat},{lon}&q={lat},{lon}"
+                title = media_info.get('title', '').strip()
+                
+                if title:
+                    message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}📍 Position: {title} - [Voir sur Apple Maps]({maps_url})"
+                else:
+                    message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}📍 Position partagée - [Voir sur Apple Maps]({maps_url})"
+            else:
+                message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}📍 Position partagée"
+            
+            if msg['reaction_emoji']:
+                message_line += self._format_reaction(msg['reaction_emoji'])
+            output.append(message_line)
+            return
+        
+        # Handle deleted messages (type 14)
+        if msg.get('message_type') == 14:
+            message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}🗑️ [Message supprimé]"
+            if msg['reaction_emoji']:
+                message_line += self._format_reaction(msg['reaction_emoji'])
+            output.append(message_line)
+            return
+        
         # Handle voice/video calls (type 59)
         if msg.get('message_type') == 59:
             direction = "📞 Appel sortant" if msg.get('is_from_me') else "📞 Appel entrant"
             message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}{direction}"
             if msg['reaction_emoji']:
-                message_line += f" [{msg['reaction_emoji']}]"
+                message_line += self._format_reaction(msg['reaction_emoji'])
             output.append(message_line)
             return
         
@@ -250,7 +312,7 @@ class ConversationFormatter:
         if msg['media_info'].get('title'):
             message_line += f" - {msg['media_info']['title']}"
         if msg['reaction_emoji']:
-            message_line += f" [{msg['reaction_emoji']}]"
+            message_line += self._format_reaction(msg['reaction_emoji'])
         
         output.append(message_line)
         
@@ -277,7 +339,7 @@ class ConversationFormatter:
             direction = "📞 Appel sortant" if msg.get('is_from_me') else "📞 Appel entrant"
             call_line = f"{indent}           {direction}"
             if msg.get('reaction_emoji'):
-                call_line += f" [{msg['reaction_emoji']}]"
+                call_line += self._format_reaction(msg['reaction_emoji'])
             output.append(call_line)
             return
         
@@ -299,7 +361,7 @@ class ConversationFormatter:
         if msg['media_info'].get('title'):
             media_line += f" - {msg['media_info']['title']}"
         if msg.get('reaction_emoji'):
-            media_line += f" [{msg['reaction_emoji']}]"
+            media_line += self._format_reaction(msg['reaction_emoji'])
         output.append(media_line)
     
     def _prepare_media_path(self, contact_name, media_info):

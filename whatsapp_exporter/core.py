@@ -639,28 +639,39 @@ class WhatsAppExporter:
             # Find JID patterns in hex data
             jid_matches = re.findall(r'333[0-9A-F]+?40732E77686174736170702E6E6574', hex_data)
             
-            if not jid_matches:
-                return emoji
-            
             reactors = []
-            for jid_hex in jid_matches:
-                try:
-                    # Decode JID
-                    jid_bytes = bytes.fromhex(jid_hex)
-                    jid_raw = jid_bytes.decode('utf-8', errors='ignore')
-                    
-                    # Extract clean phone number
-                    phone_match = re.search(r'(\d+)@s\.whatsapp\.net', jid_raw)
-                    if phone_match:
-                        phone = phone_match.group(1)
-                        clean_jid = f'{phone}@s.whatsapp.net'
+            if jid_matches:
+                for jid_hex in jid_matches:
+                    try:
+                        # Decode JID
+                        jid_bytes = bytes.fromhex(jid_hex)
+                        jid_raw = jid_bytes.decode('utf-8', errors='ignore')
                         
-                        # Get initials for this person in this group
-                        initials = self.participant_manager.get_group_initials_for_jid(group_jid, clean_jid)
-                        if initials and initials not in reactors:
-                            reactors.append(initials)
-                except Exception:
-                    continue
+                        # Extract clean phone number
+                        phone_match = re.search(r'(\d+)@s\.whatsapp\.net', jid_raw)
+                        if phone_match:
+                            phone = phone_match.group(1)
+                            clean_jid = f'{phone}@s.whatsapp.net'
+                            
+                            # Get initials for this person in this group
+                            initials = self.participant_manager.get_group_initials_for_jid(group_jid, clean_jid)
+                            if initials and initials not in reactors:
+                                reactors.append(initials)
+                    except Exception as e:
+                        continue
+            
+            # If no JID found in hex data, it means "I" (owner) reacted
+            # Get owner's initials from the group
+            if not reactors:
+                # Extract owner phone from group JID
+                if '-' in group_jid:
+                    owner_phone = group_jid.split('-')[0]
+                    owner_jid = f"{owner_phone}@s.whatsapp.net"
+                    owner_initials = self.participant_manager.get_group_initials_for_jid(group_jid, owner_jid)
+                    if owner_initials and owner_initials != "?":
+                        return f"[{owner_initials}:{emoji}]"
+                # Fallback if we can't find owner initials
+                return emoji
             
             if reactors:
                 if len(reactors) == 1:
@@ -671,7 +682,8 @@ class WhatsAppExporter:
             
             return emoji
             
-        except Exception:
+        except Exception as e:
+            print(f"DEBUG: Exception in _decode_group_reactions: {e}")
             return emoji
     
     def _get_message_media(self, message):
@@ -683,13 +695,15 @@ class WhatsAppExporter:
                         mi.ZFILESIZE,
                         mi.ZMEDIAKEY,
                         mi.ZMEDIALOCALPATH,
-                        mi.ZMEDIATITLE
+                        mi.ZTITLE,
+                        mi.ZLATITUDE,
+                        mi.ZLONGITUDE
                     FROM ZWAMEDIAITEM mi
                     WHERE mi.ZMESSAGE = ?
                 """, (message['message_id'],))
                 
                 if result:
-                    file_size, media_key, local_path, title = result
+                    file_size, media_key, local_path, title, latitude, longitude = result
                     
                     # Construct full media path
                     full_path = None
@@ -704,7 +718,9 @@ class WhatsAppExporter:
                         'local_path': full_path,
                         'title': title,
                         'message_type': message['message_type'],
-                        'file_id': media_key or f"media_{message['message_id']}"
+                        'file_id': media_key or f"media_{message['message_id']}",
+                        'latitude': latitude,
+                        'longitude': longitude
                     }
         except Exception:
             pass
