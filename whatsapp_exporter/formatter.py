@@ -27,6 +27,8 @@ class ConversationFormatter:
         self._path_exists_cache = {}
         # Cache for contact name -> JID lookups
         self._contact_jid_cache = {}
+        # Media file index: built once, used many times
+        self._media_file_index = None
     
     def _cached_path_exists(self, path):
         """Cached version of os.path.exists() to avoid repeated filesystem checks."""
@@ -34,7 +36,34 @@ class ConversationFormatter:
             self._path_exists_cache[path] = os.path.exists(path)
         return self._path_exists_cache[path]
 
-        self.db_manager = db_manager
+    def _build_media_index(self):
+        """Build an index of all media files in backup (done once for performance)."""
+        if self._media_file_index is not None:
+            return  # Already built
+        
+        print("   📑 Building media file index...")
+        import time
+        start = time.time()
+        
+        self._media_file_index = {}
+        
+        if not self.media_base_path or not os.path.exists(self.media_base_path):
+            print(f"   ⚠️ Media base path not found: {self.media_base_path}")
+            return
+        
+        try:
+            for root, dirs, files in os.walk(self.media_base_path):
+                for filename in files:
+                    # Store the full path for each filename
+                    # If multiple files have same name, keep the first one found
+                    if filename not in self._media_file_index:
+                        self._media_file_index[filename] = os.path.join(root, filename)
+            
+            elapsed = time.time() - start
+            print(f"   ✅ Media index built: {len(self._media_file_index)} files in {elapsed:.2f}s")
+        except Exception as e:
+            print(f"   ⚠️ Error building media index: {e}")
+            self._media_file_index = {}
     
     def _format_reaction(self, reaction_emoji):
         """Format reaction emoji - add brackets only if not already present."""
@@ -492,25 +521,18 @@ class ConversationFormatter:
                         if self._cached_path_exists(path):
                             return path
                     
-                    # Last resort: scan the media directory for the filename
-                    # DISABLED: Too slow! Scans entire directory tree for each missing file
-                    # return self._find_media_in_backup(filename)
-                    return None
+                    # Last resort: look up in pre-built index (fast!)
+                    return self._find_media_in_backup(filename)
             except Exception:
                 pass
         
         return None
     
     def _find_media_in_backup(self, filename):
-        """Find media file in backup directory by scanning."""
-        if not self.media_base_path or not os.path.exists(self.media_base_path):
-            return None
+        """Find media file in backup directory using pre-built index."""
+        # Build index on first call
+        if self._media_file_index is None:
+            self._build_media_index()
         
-        try:
-            for root, dirs, files in os.walk(self.media_base_path):
-                if filename in files:
-                    return os.path.join(root, filename)
-        except Exception:
-            pass
-        
-        return None
+        # Look up in index (O(1) instead of scanning entire tree)
+        return self._media_file_index.get(filename)
