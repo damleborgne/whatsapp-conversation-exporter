@@ -15,23 +15,26 @@ class MoodAnalyzer:
         self.mood_categories = {
             # Positive emotions - Joy/Laughter
             '😂': 'joy', '🤣': 'joy', '😄': 'joy', '😆': 'joy', '😁': 'joy', '😀': 'joy', '🤪': 'joy',
+            '😃': 'joy',
             
             # Positive emotions - Happiness/Contentment  
             '😊': 'happiness', '🙂': 'happiness', '😋': 'happiness', '😌': 'happiness', '😇': 'happiness', 
-            '☺️': 'happiness', '😸': 'happiness', '😺': 'happiness',
+            '☺️': 'happiness', '😸': 'happiness', '😺': 'happiness', '☺': 'happiness',
             
             # Love/Affection
             '😍': 'love', '🥰': 'love', '😘': 'love', '😗': 'love', '😙': 'love', '😚': 'love',
             '💕': 'love', '❤️': 'love', '💖': 'love', '💗': 'love', '💘': 'love', '💝': 'love',
-            '🤗': 'love', '💋': 'love', '😻': 'love',
+            '🤗': 'love', '💋': 'love', '😻': 'love', '❤': 'love', '💜': 'love', '💙': 'love',
+            '💛': 'love', '💚': 'love', '♥': 'love', '🌹': 'love', '🌺': 'love',
             
             # Approval/Support
             '👍': 'approval', '👌': 'approval', '👏': 'approval', '🤝': 'approval', '✨': 'approval',
-            '💯': 'approval', '🆒': 'approval', '✅': 'approval',
+            '💯': 'approval', '🆒': 'approval', '✅': 'approval', '🙏': 'approval',
             
             # Celebration/Excitement
             '🙌': 'celebration', '🎉': 'celebration', '🥳': 'celebration', '🎊': 'celebration',
-            '🎈': 'celebration', '🎆': 'celebration', '🎇': 'celebration',
+            '🎈': 'celebration', '🎆': 'celebration', '🎇': 'celebration', '🎂': 'celebration',
+            '🎁': 'celebration', '🎄': 'celebration', '🍾': 'celebration',
             
             # Cool/Confidence
             '😎': 'cool', '🔥': 'excitement', '💪': 'strength', '⚡': 'excitement',
@@ -39,10 +42,11 @@ class MoodAnalyzer:
             # Negative emotions - Sadness/Disappointment
             '😢': 'sadness', '😭': 'sadness', '😞': 'sadness', '😔': 'disappointment', '☹️': 'sadness',
             '😿': 'sadness', '💔': 'sadness', '😪': 'sadness', '😥': 'sadness', '😓': 'disappointment',
+            '😩': 'sadness', '😫': 'sadness', '😣': 'sadness',
             
             # Negative emotions - Anger/Frustration
             '😠': 'anger', '😡': 'anger', '🤬': 'anger', '😤': 'anger', '💢': 'anger',
-            '🔴': 'anger', '😾': 'anger',
+            '🔴': 'anger', '😾': 'anger', '😖': 'anger',
 
             # Fear/Shock/Anxiety
             '😱': 'shock', '😨': 'fear', '😰': 'anxiety', '😟': 'anxiety', '😧': 'fear',
@@ -61,13 +65,18 @@ class MoodAnalyzer:
             '😐': 'neutral', '😑': 'neutral', '😶': 'neutral', '🫤': 'neutral',
             
             # Skepticism/Dismissal
-            '🙄': 'skepticism', '😒': 'skepticism',
+            '🙄': 'skepticism', '😒': 'skepticism', '😏': 'skepticism',
             
             # Tiredness/Boredom
             '😴': 'tired', '🥱': 'tired',
             
-            # Playful/Mischievous
+            # Playful/Mischievous/Flirty
             '😜': 'playful', '😝': 'playful', '😛': 'playful', '🤭': 'playful',
+            '😉': 'playful', '😅': 'playful',
+            
+            # Miscellaneous positive
+            '👎': 'disapproval', '💫': 'misc', '🎶': 'misc', '🍀': 'misc',
+            '🕺': 'celebration', '🏃': 'misc',
         }
         
         # Add mood_emojis mapping
@@ -92,7 +101,9 @@ class MoodAnalyzer:
             'neutral': '😐',
             'skepticism': '🙄',
             'tired': '😴',
-            'playful': '😜'
+            'playful': '😜',
+            'disapproval': '👎',
+            'misc': '💫'
         }
         
         # Emoji pattern for extracting emojis from message content
@@ -232,9 +243,11 @@ class MoodAnalyzer:
             start_date = datetime.strptime(messages[0]['date'], '%Y-%m-%d %H:%M:%S')
             end_date = datetime.strptime(messages[-1]['date'], '%Y-%m-%d %H:%M:%S')
             
-            # Find the Monday of the first week and the Sunday of the last week
+            # Find the Monday of the first week and the Sunday of the last week at MIDNIGHT
             start_monday = start_date - timedelta(days=start_date.weekday())
+            start_monday = start_monday.replace(hour=0, minute=0, second=0, microsecond=0)
             end_sunday = end_date + timedelta(days=(6 - end_date.weekday()))
+            end_sunday = end_sunday.replace(hour=23, minute=59, second=59, microsecond=999999)
             
             # Create weekly buckets
             weekly_moods = {}
@@ -245,6 +258,7 @@ class MoodAnalyzer:
                 try:
                     msg_date = datetime.strptime(msg['date'], '%Y-%m-%d %H:%M:%S')
                     week_start = msg_date - timedelta(days=msg_date.weekday())
+                    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
                     week_key = week_start.strftime('%Y-%m-%d')
                     
                     if week_key not in weekly_activity:
@@ -258,6 +272,7 @@ class MoodAnalyzer:
                 try:
                     reaction_date = datetime.strptime(reaction['date'], '%Y-%m-%d %H:%M:%S')
                     week_start = reaction_date - timedelta(days=reaction_date.weekday())
+                    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
                     week_key = week_start.strftime('%Y-%m-%d')
                     
                     if week_key not in weekly_moods:

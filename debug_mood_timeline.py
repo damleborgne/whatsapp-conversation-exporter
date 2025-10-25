@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Debug script to analyze mood timeline generation for Kumiko."""
+"""Debug script to analyze mood timeline generation for a given contact."""
 
 import sys
 import os
@@ -227,4 +227,4 @@ def analyze_mood_timeline(contact_name, weeks_to_analyze=5):
             print(f"✅ Timeline character: 　 (space for no activity)")
 
 if __name__ == '__main__':
-    analyze_mood_timeline("Kumiko Kotera", weeks_to_analyze=5)
+    analyze_mood_timeline("Laure", weeks_to_analyze=5)
