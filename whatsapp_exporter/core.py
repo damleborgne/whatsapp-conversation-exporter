@@ -563,20 +563,52 @@ class WhatsAppExporter:
             return f"Member {member_id}"
     
     def _get_message_reactions(self, message, contact_jid=None):
-        """Get reaction information for a message."""
+        """Get reaction information for a message. Aggregates all reactions from multiple people."""
         try:
-            result = self.db_manager.fetch_one("""
+            # Get ALL reactions for this message (multiple people can react)
+            results = self.db_manager.fetch_all("""
                 SELECT i.ZRECEIPTINFO
                 FROM ZWAMESSAGEINFO i
                 WHERE i.ZMESSAGE = ?
             """, (message['message_id'],))
             
-            if result and result[0]:
-                receipt_info = result[0]
-                is_group = contact_jid and contact_jid.endswith('@g.us')
+            if not results:
+                return
+            
+            # Collect all reactions: {emoji: [initials1, initials2, ...]}
+            reactions_by_emoji = {}
+            is_group = bool(contact_jid and contact_jid.endswith('@g.us'))
+            
+            for row in results:
+                receipt_info = row[0]
+                if not receipt_info:
+                    continue
+                    
+                # Extract emoji and reactor initials from this receipt_info
                 emoji = self._extract_reaction_emoji(receipt_info, is_group, contact_jid)
                 if emoji:
-                    message['reaction_emoji'] = emoji
+                    # emoji is already formatted like "[Da:❤️]" or "[DoLB:❤️]"
+                    # Extract the initials and emoji
+                    match = re.match(r'\[([^:]+):(.+)\]', emoji)
+                    if match:
+                        initials, extracted_emoji = match.groups()
+                        if extracted_emoji not in reactions_by_emoji:
+                            reactions_by_emoji[extracted_emoji] = []
+                        reactions_by_emoji[extracted_emoji].append(initials)
+            
+            # Format aggregated reactions
+            if reactions_by_emoji:
+                reaction_parts = []
+                for emoji, initials_list in reactions_by_emoji.items():
+                    if len(initials_list) == 1:
+                        reaction_parts.append(f"[{initials_list[0]}:{emoji}]")
+                    else:
+                        # Multiple people reacted with same emoji
+                        reactor_list = ';'.join([f"{init}:{emoji}" for init in initials_list])
+                        reaction_parts.append(f"[{reactor_list}]")
+                
+                # Join all reactions with space
+                message['reaction_emoji'] = ' '.join(reaction_parts)
         except Exception:
             pass
     
@@ -642,56 +674,41 @@ class WhatsAppExporter:
             return None
     
     def _decode_group_reactions(self, blob, emoji, group_jid):
-        """Decode group reactions with person initials by parsing blob structure."""
+        """Decode group reactions with person initials by searching ALL JIDs in blob."""
         try:
-            # Parse blob to find JID fields (tag 3 or 4 typically contains JIDs)
+            # Decode entire blob and search for ALL JID patterns
+            decoded_blob = blob.decode('utf-8', errors='ignore')
             reactors = []
-            i = 0
-            while i < len(blob) - 2:
-                b = blob[i]
-                if (b & 7) == 2 and i + 1 < len(blob):  # String field
-                    tag = b >> 3
-                    length = blob[i + 1]
-                    
-                    # JIDs can be in various tags and formats
-                    if 10 <= length <= 50:
-                        data = blob[i + 2:i + 2 + length]
-                        try:
-                            decoded = data.decode('utf-8', 'strict')
-                            
-                            # Format 1: Full JID with @s.whatsapp.net
-                            if '@s.whatsapp.net' in decoded:
-                                phone_match = re.search(r'(\d+)@s\.whatsapp\.net', decoded)
-                                if phone_match:
-                                    phone = phone_match.group(1)
-                                    clean_jid = f'{phone}@s.whatsapp.net'
-                                    initials = self.participant_manager.get_group_initials_for_jid(group_jid, clean_jid)
-                                    if initials and initials not in reactors:
-                                        reactors.append(initials)
-                            
-                            # Format 2: Just phone number (10-15 digits)
-                            elif decoded.isdigit() and 10 <= len(decoded) <= 15:
-                                clean_jid = f'{decoded}@s.whatsapp.net'
-                                initials = self.participant_manager.get_group_initials_for_jid(group_jid, clean_jid)
-                                if initials and initials not in reactors:
-                                    reactors.append(initials)
-                        except:
-                            pass
-                    
-                    i += 2 + length
-                else:
-                    i += 1
             
-            # If no JID found in blob, it means "I" (owner) reacted
-            # Get owner's initials from the group
+            # Find ALL phone numbers followed by @s.whatsapp.net
+            jid_matches = re.findall(r'(\d{10,15})@s\.whatsapp\.net', decoded_blob)
+            
+            for phone in jid_matches:
+                clean_jid = f'{phone}@s.whatsapp.net'
+                initials = self.participant_manager.get_group_initials_for_jid(group_jid, clean_jid)
+                if initials and initials not in reactors:
+                    reactors.append(initials)
+            
+            # Count how many times this emoji appears in the blob
+            # If there are more emoji occurrences than JIDs, one of them is probably "me"
+            emoji_count = decoded_blob.count(emoji)
+            
+            if emoji_count > len(jid_matches):
+                # There's a reaction without a JID - it's probably mine
+                my_jid = self.participant_manager._get_my_jid()
+                if my_jid:
+                    my_initials = self.participant_manager.get_group_initials_for_jid(group_jid, my_jid)
+                    if my_initials and my_initials != "?" and my_initials not in reactors:
+                        reactors.append(my_initials)
+            
+            # If still no reactors found at all, fallback to "me"
             if not reactors:
-                # Try to get "my" JID
                 my_jid = self.participant_manager._get_my_jid()
                 if my_jid:
                     my_initials = self.participant_manager.get_group_initials_for_jid(group_jid, my_jid)
                     if my_initials and my_initials != "?":
                         return f"[{my_initials}:{emoji}]"
-                # Fallback if we can't find my initials
+                # Ultimate fallback
                 return emoji
             
             if reactors:
