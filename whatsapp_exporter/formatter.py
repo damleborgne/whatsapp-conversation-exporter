@@ -23,6 +23,18 @@ class ConversationFormatter:
         self.media_base_path = media_base_path
         self.backup_mode = backup_mode
         self.db_manager = db_manager
+        # Cache for os.path.exists() calls to speed up media processing
+        self._path_exists_cache = {}
+        # Cache for contact name -> JID lookups
+        self._contact_jid_cache = {}
+    
+    def _cached_path_exists(self, path):
+        """Cached version of os.path.exists() to avoid repeated filesystem checks."""
+        if path not in self._path_exists_cache:
+            self._path_exists_cache[path] = os.path.exists(path)
+        return self._path_exists_cache[path]
+
+        self.db_manager = db_manager
     
     def _format_reaction(self, reaction_emoji):
         """Format reaction emoji - add brackets only if not already present."""
@@ -36,6 +48,8 @@ class ConversationFormatter:
     
     def format_conversation(self, messages, contact_name, contact_jid=None):
         """Format conversation for export."""
+        import time
+        start_time = time.time()
         if not messages:
             return "No messages found."
         
@@ -48,7 +62,9 @@ class ConversationFormatter:
         output.append(f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Add mood timeline analysis
+        t1 = time.time()
         mood_analysis = self.mood_analyzer.analyze_mood_timeline(messages)
+        print(f"    ⏱️  Mood analysis: {time.time() - t1:.2f}s")
         if mood_analysis and mood_analysis.get('weekly_timeline'):
             output.append("")
             output.append("MOOD TIMELINE:")
@@ -60,8 +76,10 @@ class ConversationFormatter:
                 output.append(f"Total reactions: {mood_analysis['total_reactions']}")
         
         # Add participants list if we have the contact_jid
+        t2 = time.time()
         if contact_jid:
             participants = self.participant_manager.get_conversation_participants(contact_jid)
+            print(f"    ⏱️  Get participants: {time.time() - t2:.2f}s")
             if participants:
                 output.append("")
                 output.append("PARTICIPANTS:")
@@ -103,20 +121,27 @@ class ConversationFormatter:
         output.append("=" * 80)
         output.append("")
         
-        # Format message content
+        # Format messages
+        t3 = time.time()
         self._format_messages(output, messages, contact_name)
+        print(f"    ⏱️  Format messages: {time.time() - t3:.2f}s")
+        print(f"    ⏱️  Format TOTAL: {time.time() - start_time:.2f}s")
         
         # Stats
         output.append("")
         output.append("=" * 80)
         output.append(f"📊 Total messages: {len(messages)}")
         output.append("=" * 80)
+        
         return "\n".join(output)
     
     def _format_messages(self, output, messages, contact_name):
         """Format the actual message content."""
+        import time
         current_date = None
-        for msg in messages:
+        slow_messages = []
+        for i, msg in enumerate(messages):
+            msg_start = time.time()
             message_date = msg['date']
             if not message_date:
                 continue
@@ -151,6 +176,18 @@ class ConversationFormatter:
                 self._format_quoted_message(output, msg, time_part, prefix, indent, sender_prefix, contact_name)
             else:
                 self._format_regular_message(output, msg, time_part, prefix, indent, sender_prefix, contact_name)
+            
+            # Track slow messages
+            msg_time = time.time() - msg_start
+            if msg_time > 0.01:  # More than 10ms
+                slow_messages.append((i, msg['message_id'], msg_time))
+        
+        # Show slowest messages
+        if slow_messages:
+            slow_messages.sort(key=lambda x: x[2], reverse=True)
+            print(f"      ⚠️  {len(slow_messages)} slow messages (>10ms), top 5:")
+            for idx, msg_id, duration in slow_messages[:5]:
+                print(f"         Message {idx} (ID:{msg_id}): {duration*1000:.1f}ms")
     
     def _format_quoted_message(self, output, msg, time_part, prefix, indent, sender_prefix, contact_name):
         """Format a message with citation/quote."""
@@ -251,16 +288,22 @@ class ConversationFormatter:
         """Format a message with media."""
         from .utils import get_media_type_name
         
+        # Check if media_info is None - shouldn't happen but handle gracefully
+        if msg.get('media_info') is None:
+            # Treat as empty message
+            output.append(f"[{time_part}]{indent} {prefix} {sender_prefix}[Empty media message - Type {msg.get('message_type', '?')}]")
+            return
+        
         # Handle location messages (type 5)
         if msg.get('message_type') == 5:
-            media_info = msg.get('media_info', {})
+            media_info = msg.get('media_info') or {}
             lat = media_info.get('latitude')
             lon = media_info.get('longitude')
             
             if lat and lon and lat != 0 and lon != 0:
                 # Create Apple Maps link
                 maps_url = f"https://maps.apple.com/?ll={lat},{lon}&q={lat},{lon}"
-                title = media_info.get('title', '').strip()
+                title = (media_info.get('title') or '').strip()
                 
                 if title:
                     message_line = f"[{time_part}]{indent} {prefix} {sender_prefix}📍 Position: {title} - [Voir sur Apple Maps]({maps_url})"
@@ -375,8 +418,10 @@ class ConversationFormatter:
         safe_contact_name = "".join(c for c in contact_name if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')
         media_dir = f"conversations/media/{safe_contact_name}"
         
-        if not os.path.exists(media_dir):
+        if not self._cached_path_exists(media_dir):
             os.makedirs(media_dir, exist_ok=True)
+            # Mark as existing in cache after creation
+            self._path_exists_cache[media_dir] = True
         
         # Extract filename from original path
         filename = os.path.basename(original_path)
@@ -401,10 +446,11 @@ class ConversationFormatter:
             full_source_path = os.path.join(self.media_base_path, original_path) if self.media_base_path else None
         
         try:
-            if full_source_path and os.path.exists(full_source_path) and not os.path.exists(full_target_path):
+            if full_source_path and self._cached_path_exists(full_source_path) and not self._cached_path_exists(full_target_path):
                 shutil.copy2(full_source_path, full_target_path)
+                self._path_exists_cache[full_target_path] = True  # Mark as existing
                 print(f"   📎 Copied media: {filename}")
-            elif os.path.exists(full_target_path):
+            elif self._cached_path_exists(full_target_path):
                 pass  # Media already exists
             else:
                 pass  # Media not found - will show [Not downloaded]
@@ -420,15 +466,22 @@ class ConversationFormatter:
         if not filename:
             return None
         
-        # Find contact JID by name
+        # Find contact JID by name (with caching!)
         if self.db_manager:
             try:
-                result = self.db_manager.fetch_one(
-                    "SELECT ZCONTACTJID FROM ZWACHATSESSION WHERE ZPARTNERNAME = ?", 
-                    (contact_name,)
-                )
-                if result:
-                    contact_jid = result[0]
+                # Check cache first
+                if contact_name not in self._contact_jid_cache:
+                    result = self.db_manager.fetch_one(
+                        "SELECT ZCONTACTJID FROM ZWACHATSESSION WHERE ZPARTNERNAME = ?", 
+                        (contact_name,)
+                    )
+                    if result:
+                        self._contact_jid_cache[contact_name] = result[0]
+                    else:
+                        self._contact_jid_cache[contact_name] = None
+                
+                contact_jid = self._contact_jid_cache.get(contact_name)
+                if contact_jid:
                     # Try to find the file in the backup media structure
                     possible_paths = [
                         os.path.join(self.media_base_path, contact_jid, filename),
@@ -436,11 +489,13 @@ class ConversationFormatter:
                     ]
                     
                     for path in possible_paths:
-                        if os.path.exists(path):
+                        if self._cached_path_exists(path):
                             return path
                     
                     # Last resort: scan the media directory for the filename
-                    return self._find_media_in_backup(filename)
+                    # DISABLED: Too slow! Scans entire directory tree for each missing file
+                    # return self._find_media_in_backup(filename)
+                    return None
             except Exception:
                 pass
         

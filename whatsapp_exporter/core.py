@@ -140,14 +140,20 @@ class WhatsAppExporter:
     
     def export_conversation(self, contact_input, backup_mode=None, limit=None, recent=False):
         """Export a specific conversation."""
+        import time
+        start_time = time.time()
         try:
             # Find target contact
+            t1 = time.time()
             target_contact = self._find_contact(contact_input)
+            print(f"⏱️  Find contact: {time.time() - t1:.2f}s")
             if not target_contact:
                 return None
             
             # Get messages
+            t2 = time.time()
             messages = self._get_conversation_messages(target_contact['jid'], limit, recent)
+            print(f"⏱️  Get messages: {time.time() - t2:.2f}s")
             if not messages:
                 print(f"❌ No messages found for {target_contact['name']}")
                 return None
@@ -155,9 +161,12 @@ class WhatsAppExporter:
             print(f"📋 Found {len(messages)} messages...")
             
             # Export
+            t3 = time.time()
             formatted_text = self.formatter.format_conversation(messages, target_contact['name'], target_contact['jid'])
+            print(f"⏱️  Format conversation: {time.time() - t3:.2f}s")
             
             # Save to file
+            t4 = time.time()
             filename = self._generate_filename(target_contact['name'])
             filepath = os.path.join("conversations", filename)
             
@@ -166,13 +175,21 @@ class WhatsAppExporter:
             
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(formatted_text)
+            print(f"⏱️  Write file: {time.time() - t4:.2f}s")
             
             print(f"✅ Conversation exported to: {filepath}")
             print(f"📄 File size: {os.path.getsize(filepath)} bytes")
+            print(f"⏱️  TOTAL TIME: {time.time() - start_time:.2f}s")
             return filepath
             
         except Exception as e:
+            import traceback
+            import sys
             print(f"❌ Error exporting conversation: {e}")
+            print("\n🔍 Full traceback:")
+            sys.stdout.flush()
+            traceback.print_exc()
+            sys.stdout.flush()
             return None
     
     def _find_contact(self, contact_input):
@@ -221,10 +238,12 @@ class WhatsAppExporter:
     
     def _get_conversation_messages(self, contact_jid, limit=None, recent=False):
         """Get messages for a conversation."""
+        import time
         self.messages = []
         
         try:
             # Base query for messages - matches the working original code
+            t1 = time.time()
             query = """
                 SELECT 
                     m.Z_PK as message_id,
@@ -258,16 +277,21 @@ class WhatsAppExporter:
                 query += f" LIMIT {limit}"
             
             rows = self.db_manager.fetch_all(query, params)
+            print(f"    ⏱️  SQL query: {time.time() - t1:.2f}s ({len(rows)} rows)")
             
             if recent and rows:
                 rows = list(reversed(rows))
             
             # Process each message
+            t2 = time.time()
             for row in rows:
                 self._process_message_row(row, contact_jid)
+            print(f"    ⏱️  Process rows: {time.time() - t2:.2f}s")
             
             # Post-process messages
+            t3 = time.time()
             self._post_process_messages(contact_jid)
+            print(f"    ⏱️  Post-process: {time.time() - t3:.2f}s")
             
             return self.messages
             
@@ -562,115 +586,112 @@ class WhatsAppExporter:
             return None
             
         try:
-            if isinstance(receipt_info, bytes):
-                hex_data = receipt_info.hex().upper()
-            else:
-                hex_data = str(receipt_info).upper()
+            blob = receipt_info if isinstance(receipt_info, bytes) else None
+            if not blob:
+                return None
             
-            # Find emoji with automatic modifier detection
+            # Try to decode the whole blob as UTF-8 (ignoring errors)
+            # Then find emoji characters within it
+            decoded_blob = blob.decode('utf-8', errors='ignore')
+            
             emoji = None
-            if 'F09F' in hex_data:
-                # Modern emojis (F09F prefix) - may have skin tone modifiers
-                base_matches = re.findall(r'F09F[0-9A-F]{4}', hex_data)
-                if base_matches:
-                    # Try each match until we find a valid emoji
-                    for base_emoji in base_matches:
-                        try:
-                            base_pos = hex_data.find(base_emoji)
-                            remaining = hex_data[base_pos + len(base_emoji):]
-                            
-                            # Look for skin tone modifier (F09F8F[BB-BF])
-                            skin_modifier_match = re.match(r'F09F8F(BB|BC|BD|BE|BF)', remaining)
-                            if skin_modifier_match:
-                                full_sequence = base_emoji + skin_modifier_match.group(0)
-                                emoji = bytes.fromhex(full_sequence).decode('utf-8')
-                            else:
-                                emoji = bytes.fromhex(base_emoji).decode('utf-8')
-                            
-                            # If we successfully decoded an emoji, break
-                            if emoji:
-                                break
-                        except:
-                            # This match wasn't a valid emoji, try next one
-                            continue
-                        
-            elif 'E2' in hex_data:
-                # Legacy Unicode symbols (E2xx prefix) - may have color modifiers
-                # Match 6 hex chars (3 bytes): E2 + 2 more bytes
-                # Valid ranges: E2[8-9A-B][0-9A-F]{3} (captures all E280-E2BF)
-                base_matches = re.findall(r'E2[8-9A-B][0-9A-F][0-9A-F]{2}', hex_data)
-                if base_matches:
-                    # Try each match until we find a valid emoji
-                    for base_emoji in base_matches:
-                        try:
-                            base_pos = hex_data.find(base_emoji)
-                            remaining = hex_data[base_pos + len(base_emoji):]
-                            
-                            # Look for color modifier (EFB8[8F-AB])
-                            color_modifier_match = re.match(r'EFB8[8-9A-B][0-9A-F]', remaining)
-                            if color_modifier_match:
-                                full_sequence = base_emoji + color_modifier_match.group(0)
-                                emoji = bytes.fromhex(full_sequence).decode('utf-8')
-                            else:
-                                emoji = bytes.fromhex(base_emoji).decode('utf-8')
-                            
-                            # If we successfully decoded an emoji, break
-                            if emoji:
-                                break
-                        except:
-                            # This match wasn't a valid emoji, try next one
-                            continue
+            # Look for emoji characters (skip ASCII and common control chars)
+            i = 0
+            while i < len(decoded_blob):
+                char = decoded_blob[i]
+                cp = ord(char)
+                # Check if it's in known emoji ranges (precise ranges to avoid math symbols)
+                if (0x1F000 <= cp <= 0x1FFFF or      # All modern emoji blocks
+                    0x2600 <= cp <= 0x26FF or         # Misc symbols (☀️ ☁️ ⚡ etc)
+                    0x2700 <= cp <= 0x27BF or         # Dingbats (✂️ ✈️ ✉️ ✏️ ✒️ ✔️ ✖️ ✨ ✳️ ✴️ ❄️ ❇️ ❌ ❎ ❓ ❔ ❕ ❗ ❤️ ➕ ➖ ➗ ➡️ ➰ etc)
+                    0x2B05 <= cp <= 0x2B07 or         # Arrows (⬅️ ⬆️ ⬇️)
+                    0x2934 <= cp <= 0x2935 or         # Curved arrows
+                    0x2B50 <= cp <= 0x2B55 or         # Stars and circles (⭐ ⭕)
+                    0x3030 == cp or                   # Wavy dash
+                    0x303D == cp or                   # Part alternation mark
+                    0x3297 == cp or                   # Circled ideograph
+                    0x3299 == cp):                    # Circled ideograph
+                    emoji = char
+                    # Check for modifiers/variant selectors following
+                    j = i + 1
+                    while j < len(decoded_blob):
+                        next_char = decoded_blob[j]
+                        next_cp = ord(next_char)
+                        # Skin tone (1F3FB-1F3FF) or variant selector (FE00-FE0F) or ZWJ (200D)
+                        if (0x1F3FB <= next_cp <= 0x1F3FF or
+                            0xFE00 <= next_cp <= 0xFE0F or
+                            next_cp == 0x200D or
+                            0x1F1E6 <= next_cp <= 0x1F1FF):  # Regional indicators (flags)
+                            emoji += next_char
+                            j += 1
+                        else:
+                            break
+                    break
+                i += 1
             
             if not emoji:
                 return None
             
             # For groups, try to extract who reacted
             if is_group and group_jid:
-                return self._decode_group_reactions(hex_data, emoji, group_jid)
+                return self._decode_group_reactions(blob, emoji, group_jid)
             else:
                 return emoji
                 
         except Exception:
             return None
     
-    def _decode_group_reactions(self, hex_data, emoji, group_jid):
-        """Decode group reactions with person initials."""
+    def _decode_group_reactions(self, blob, emoji, group_jid):
+        """Decode group reactions with person initials by parsing blob structure."""
         try:
-            # Find JID patterns in hex data
-            jid_matches = re.findall(r'333[0-9A-F]+?40732E77686174736170702E6E6574', hex_data)
-            
+            # Parse blob to find JID fields (tag 3 or 4 typically contains JIDs)
             reactors = []
-            if jid_matches:
-                for jid_hex in jid_matches:
-                    try:
-                        # Decode JID
-                        jid_bytes = bytes.fromhex(jid_hex)
-                        jid_raw = jid_bytes.decode('utf-8', errors='ignore')
-                        
-                        # Extract clean phone number
-                        phone_match = re.search(r'(\d+)@s\.whatsapp\.net', jid_raw)
-                        if phone_match:
-                            phone = phone_match.group(1)
-                            clean_jid = f'{phone}@s.whatsapp.net'
+            i = 0
+            while i < len(blob) - 2:
+                b = blob[i]
+                if (b & 7) == 2 and i + 1 < len(blob):  # String field
+                    tag = b >> 3
+                    length = blob[i + 1]
+                    
+                    # JIDs can be in various tags and formats
+                    if 10 <= length <= 50:
+                        data = blob[i + 2:i + 2 + length]
+                        try:
+                            decoded = data.decode('utf-8', 'strict')
                             
-                            # Get initials for this person in this group
-                            initials = self.participant_manager.get_group_initials_for_jid(group_jid, clean_jid)
-                            if initials and initials not in reactors:
-                                reactors.append(initials)
-                    except Exception as e:
-                        continue
+                            # Format 1: Full JID with @s.whatsapp.net
+                            if '@s.whatsapp.net' in decoded:
+                                phone_match = re.search(r'(\d+)@s\.whatsapp\.net', decoded)
+                                if phone_match:
+                                    phone = phone_match.group(1)
+                                    clean_jid = f'{phone}@s.whatsapp.net'
+                                    initials = self.participant_manager.get_group_initials_for_jid(group_jid, clean_jid)
+                                    if initials and initials not in reactors:
+                                        reactors.append(initials)
+                            
+                            # Format 2: Just phone number (10-15 digits)
+                            elif decoded.isdigit() and 10 <= len(decoded) <= 15:
+                                clean_jid = f'{decoded}@s.whatsapp.net'
+                                initials = self.participant_manager.get_group_initials_for_jid(group_jid, clean_jid)
+                                if initials and initials not in reactors:
+                                    reactors.append(initials)
+                        except:
+                            pass
+                    
+                    i += 2 + length
+                else:
+                    i += 1
             
-            # If no JID found in hex data, it means "I" (owner) reacted
+            # If no JID found in blob, it means "I" (owner) reacted
             # Get owner's initials from the group
             if not reactors:
-                # Extract owner phone from group JID
-                if '-' in group_jid:
-                    owner_phone = group_jid.split('-')[0]
-                    owner_jid = f"{owner_phone}@s.whatsapp.net"
-                    owner_initials = self.participant_manager.get_group_initials_for_jid(group_jid, owner_jid)
-                    if owner_initials and owner_initials != "?":
-                        return f"[{owner_initials}:{emoji}]"
-                # Fallback if we can't find owner initials
+                # Try to get "my" JID
+                my_jid = self.participant_manager._get_my_jid()
+                if my_jid:
+                    my_initials = self.participant_manager.get_group_initials_for_jid(group_jid, my_jid)
+                    if my_initials and my_initials != "?":
+                        return f"[{my_initials}:{emoji}]"
+                # Fallback if we can't find my initials
                 return emoji
             
             if reactors:
@@ -734,10 +755,14 @@ class WhatsAppExporter:
     
     def _post_process_messages(self, contact_jid):
         """Post-process messages for citations and forwards."""
+        import time
         # Create message lookup for parent references
+        t1 = time.time()
         message_lookup = {msg['message_id']: msg for msg in self.messages}
+        print(f"      ⏱️  Message lookup: {time.time() - t1:.2f}s")
         
         # Step 1: Resolve parent message quotes (like the original code)
+        t2 = time.time()
         for message in self.messages:
             if (not message.get('quoted_text') and message.get('parent_message_id') 
                 and message['parent_message_id'] in message_lookup):
@@ -746,11 +771,14 @@ class WhatsAppExporter:
                 if len(parent_msg.get('content', '')) > 50:
                     quoted_content += "..."
                 message['quoted_text'] = quoted_content
+        print(f"      ⏱️  Resolve parent quotes: {time.time() - t2:.2f}s")
         
         # Step 2: Parse metadata for replies (like the original code)
+        t3 = time.time()
         reply_targets = [m for m in self.messages 
                         if not m.get('quoted_text') and not m.get('parent_message_id') and m.get('media_item_id')]
         self._parse_metadata_replies(reply_targets)
+        print(f"      ⏱️  Parse metadata replies: {time.time() - t3:.2f}s")
     
     def _parse_metadata_replies(self, targets):
         """Parse metadata to find reply relationships (from original code)."""
@@ -882,6 +910,10 @@ class WhatsAppExporter:
     
     def _find_matching_message_by_content(self, quoted_content, reply_msg):
         """Find a message that matches quoted content directly."""
+        # Check if quoted_content is None or empty
+        if not quoted_content:
+            return None
+            
         # Clean quoted content for matching
         clean_quoted = quoted_content.lower().strip()
         
@@ -912,7 +944,9 @@ class WhatsAppExporter:
                     continue
                     
                 # Check content similarity
-                candidate_content = candidate['content'].lower().strip()
+                candidate_content = (candidate.get('content') or '').lower().strip()
+                if not candidate_content:
+                    continue
                 
                 # Direct substring match (quoted content should be subset of original)
                 if clean_quoted[:50] in candidate_content:
