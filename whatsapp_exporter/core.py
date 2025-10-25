@@ -664,14 +664,55 @@ class WhatsAppExporter:
             if not emoji:
                 return None
             
-            # For groups, try to extract who reacted
+            # For groups, try to extract who reacted with initials
             if is_group and group_jid:
                 return self._decode_group_reactions(blob, emoji, group_jid)
             else:
-                return emoji
+                # For private conversations (1-to-1), also show who reacted
+                # The reactor is always the other person (not me)
+                return self._decode_private_reaction(blob, emoji, group_jid)
                 
         except Exception:
             return None
+    
+    def _decode_private_reaction(self, blob, emoji, contact_jid):
+        """Decode private (1-to-1) reactions - show who reacted."""
+        try:
+            # In private conversations, it's either me or the other person
+            # Find if there's a JID in the blob
+            decoded_blob = blob.decode('utf-8', errors='ignore')
+            jid_match = re.search(r'(\d{10,15})@s\.whatsapp\.net', decoded_blob)
+            
+            if jid_match:
+                # There's a JID - get the contact name
+                reactor_jid = jid_match.group(0)
+                # Get the contact name from database
+                result = self.db_manager.fetch_one("""
+                    SELECT ZPARTNERNAME FROM ZWACHATSESSION WHERE ZCONTACTJID = ?
+                """, (reactor_jid,))
+                
+                if result and result[0]:
+                    name = result[0]
+                    # Extract first name only
+                    first_name = name.split()[0] if name else "Unknown"
+                    return f"[{first_name}:{emoji}]"
+            
+            # No JID found, or couldn't get name - it's probably me
+            # Check if I'm the one who reacted
+            my_jid = self.participant_manager._get_my_jid()
+            if my_jid:
+                result = self.db_manager.fetch_one("""
+                    SELECT ZPARTNERNAME FROM ZWACHATSESSION WHERE ZCONTACTJID = ?
+                """, (my_jid,))
+                if result and result[0]:
+                    # Use "Moi" or my first name
+                    return f"[Moi:{emoji}]"
+            
+            # Fallback: just return the emoji
+            return emoji
+            
+        except Exception:
+            return emoji
     
     def _decode_group_reactions(self, blob, emoji, group_jid):
         """Decode group reactions with person initials by searching ALL JIDs in blob."""
