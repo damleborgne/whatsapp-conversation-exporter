@@ -129,25 +129,41 @@ class MoodAnalyzer:
                     # Parse the reaction emoji(s)
                     reaction_text = msg['reaction_emoji']
                     
-                    # Handle group reactions format [AB:😂;CD:😍]
+                    # Handle group reactions format [AB:😂;CD:😍] or simple reactions [😂]
                     if reaction_text.startswith('[') and reaction_text.endswith(']'):
-                        # Group reactions
                         reaction_content = reaction_text[1:-1]  # Remove brackets
-                        individual_reactions = reaction_content.split(';')
                         
-                        for reaction_item in individual_reactions:
-                            if ':' in reaction_item:
-                                person, emoji = reaction_item.split(':', 1)
-                                mood = self.mood_categories.get(emoji, 'unknown')
-                                if mood != 'unknown':
-                                    reactions_timeline.append({
-                                        'date': msg['date'],
-                                        'emoji': emoji,
-                                        'mood': mood,
-                                        'person': person.strip(),
-                                        'is_group': True,
-                                        'source': 'reaction'
-                                    })
+                        # Check if it's a group reaction (contains :)
+                        if ':' in reaction_content:
+                            # Group reactions - parse each individual reaction
+                            individual_reactions = reaction_content.split(';')
+                            
+                            for reaction_item in individual_reactions:
+                                if ':' in reaction_item:
+                                    person, emoji = reaction_item.split(':', 1)
+                                    mood = self.mood_categories.get(emoji, 'unknown')
+                                    if mood != 'unknown':
+                                        reactions_timeline.append({
+                                            'date': msg['date'],
+                                            'emoji': emoji,
+                                            'mood': mood,
+                                            'person': person.strip(),
+                                            'is_group': True,
+                                            'source': 'reaction'
+                                        })
+                        else:
+                            # Simple reaction in brackets [😂] - just extract the emoji
+                            emoji = reaction_content
+                            mood = self.mood_categories.get(emoji, 'unknown')
+                            if mood != 'unknown':
+                                reactions_timeline.append({
+                                    'date': msg['date'],
+                                    'emoji': emoji,
+                                    'mood': mood,
+                                    'person': 'Contact' if not msg.get('is_from_me') else 'Moi',
+                                    'is_group': False,
+                                    'source': 'reaction'
+                                })
                     else:
                         # Individual reaction
                         emoji = reaction_text.strip()
